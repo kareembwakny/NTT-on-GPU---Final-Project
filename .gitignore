@@ -1,0 +1,21 @@
+# build artifacts
+*.o
+*.obj
+*.exe
+a.out
+build/
+bin/
+
+# Office lock/temp files
+~$*
+~WRL*.tmp
+.~lock.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/

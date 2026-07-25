@@ -1,0 +1,8 @@
+workload,N,batch,selected_backend,batch_runtime_ms,us_per_transform,transforms_per_s,coefficients_per_s,effective_gbps_estimated,pct_of_616_peak,speedup_vs_gpu_ntt_raw,output_order_scope,source
+small-N low batch,256,1,warp_shuffle_shoup,0.004576,4.576,218531,5.594e+07,0.4,0.1,1.9301,raw native order,final_cuda_representative_throughput.csv (job 153)
+small-N pre-saturation,256,2048,warp_shuffle_shoup,0.021280,0.010,96240602,2.464e+10,197.1,32.0,1.0842,raw native order,final_cuda_representative_throughput.csv (job 153)
+small-N saturation (runtime hands off to GPU-NTT),256,8192,gpu_ntt,0.069888,0.009,117216117,3.001e+10,240.1,39.0,0.9463,raw native order,final_cuda_representative_throughput.csv (job 153)
+small-N saturation (our-kernel peak at same cell),256,8192,warp_shuffle_shoup,0.073856,0.009,110918544,2.840e+10,227.2,36.9,0.9463,raw native order,final_cuda_output_order_cost.csv (job 153)
+medium-N,2048,32,shoup_pad,0.008960,0.280,3571429,7.314e+09,58.5,9.5,1.3321,raw native order,final_cuda_representative_throughput.csv (job 153)
+large-N low batch,16384,1,gpu_ntt,0.010240,10.240,97656,1.600e+09,12.8,2.1,0.9697,raw native order,final_cuda_representative_throughput.csv (job 153)
+large-N high batch,16384,128,gpu_ntt,0.089728,0.701,1426534,2.337e+10,187.0,30.4,0.8165,raw native order,final_cuda_representative_throughput.csv (job 153)

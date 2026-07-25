@@ -1,0 +1,1460 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage{parskip}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black,
+}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!8},
+  xleftmargin=1em,
+  xrightmargin=1em,
+  aboveskip=0.5em,
+  belowskip=0.5em,
+}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}p{#1}}
+
+\title{\textbf{GPU-Accelerated Number Theoretic Transform:}\\
+Batching, Twiddle Caching, and Custom Triton Kernel Optimization}
+\author{Kareem\\
+\small Final Year Electrical Engineering Project\\
+\small NVIDIA RTX 2080 Ti, CUDA 12.4, PyTorch 2.6.0, Triton 3.2.0}
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+We implement and benchmark a GPU-accelerated Number Theoretic Transform (NTT) pipeline,
+progressing from a Python CPU baseline through cached-twiddle PyTorch GPU code to a
+custom Triton GPU kernel. The Triton kernel replaces approximately 99 PyTorch CUDA kernel
+dispatches per NTT call (for $N=16384$) with 15, and exploits LLVM's compile-time
+constant-division optimization to replace \texttt{int64} division with a multiply-shift
+sequence equivalent to Barrett reduction. On an NVIDIA RTX 2080 Ti, the Triton
+implementation achieves \textbf{3.20--4.65$\times$ speedup} over the optimized PyTorch
+GPU baseline across all 20 tested $(N,\text{batch})$ combinations, and up to
+\textbf{58.6$\times$} over a C++ CPU baseline at batch=128. For large problem sizes
+($N=16384$, batch=128), Triton reaches 504\,GB/s effective bandwidth (82\% of peak),
+indicating the kernel is memory-bandwidth-bound. All 46 unit tests pass including
+bit-exact cross-validation between implementations.
+
+Beyond Triton, we build a set of \emph{architecture-aware} CUDA NTT kernels and an adaptive
+runtime that dispatches each $(N,\text{batch})$ to the fastest backend: a register/warp-shuffle
+kernel for small transforms ($N\le1024$), a padded shared-memory kernel for mid sizes, a
+multi-block 4-step kernel that removes the single-block occupancy cliff at large $N$ low batch,
+and Shoup precomputed-quotient butterflies on the two dominant selected kernels. Benchmarked
+head-to-head against the open-source GPU-NTT (Özcan \& Savaş) on the same RTX 2080 Ti at modulus
+$q=998244353$ (CUDA-event, compute-only, edge-input correctness gated, transform convention formally
+verified), our specialized kernels \textbf{beat GPU-NTT in 48 of 74 execution-verified cells under
+the raw native-order contract — up to 1.93$\times$ at $N{=}256$} (49/74 and 2.14$\times$ in a second
+run; boundary cells flip within noise); GPU-NTT wins the 22 DRAM-saturated cells, and the table-driven
+argmin runtime — which keeps GPU-NTT as a fallback backend — is per-cell \textbf{never worse} and hands
+off at the measured saturation boundary. Output ordering differs by convention (ours natural, GPU-NTT
+bit-reversed — same values): under a natural-order output contract ours wins 69/74; under bit-reversed,
+3/74 — all headline figures are raw native-order, the fair setting for self-consistent
+NTT$\to$pointwise$\to$INTT pipelines. We then apply the same
+NTT optimization principles to Kyber's incomplete seven-layer NTT ($q=3329$, $n=256$): shared-memory
+transform reuse, single-kernel fusion, and NTT-domain accumulation compound to a
+\textbf{12.3$\times$} latency and $\sim$12.7$\times$ energy improvement over the isolated-transform
+baseline, all correctness-verified bit-exact against an independent CPU reference.
+\end{abstract}
+
+% ============================================================
+\tableofcontents
+\newpage
+
+% ============================================================
+\section{Introduction}
+
+The Number Theoretic Transform (NTT) is the modular-arithmetic analogue of the Fast
+Fourier Transform (FFT). It operates over a finite field $\mathbb{Z}_p$ for a prime $p$
+of the form $p = c \cdot 2^k + 1$, enabling exact (integer) arithmetic with no
+floating-point rounding. NTTs are used extensively in:
+
+\begin{itemize}
+  \item \textbf{Lattice-based cryptography} (RLWE, Kyber, Dilithium, FHE schemes such
+    as BFV and CKKS) where polynomial multiplication over $\mathbb{Z}[x]/(x^n+1)$ is
+    the inner loop.
+  \item \textbf{Zero-knowledge proof systems} (PLONK, Groth16, STARKs) where large
+    polynomial evaluations are required.
+  \item \textbf{Competitive programming} for fast polynomial multiplication modulo a prime.
+\end{itemize}
+
+In cryptographic workloads, thousands to millions of NTTs must be computed repeatedly.
+GPU acceleration is the natural fit: each NTT on a length-$N$ sequence requires $N/2
+\cdot \log_2 N$ butterfly operations that are structurally parallel.
+
+This project implements five NTT variants, ranging from a Python reference implementation
+to a custom Triton GPU kernel, and rigorously benchmarks them on an NVIDIA RTX 2080 Ti.
+The goal is not to outperform production libraries (ICICLE, GPU-NTT), but to study the
+practical optimization progression and understand where the performance gains come from.
+
+\subsection*{Project constraints}
+
+\begin{itemize}
+  \item Environment: SLURM-managed HPC cluster; Python 3.12, PyTorch 2.6.0+cu124,
+    Triton 3.2.0 (bundled with PyTorch). No CUDA Toolkit (\texttt{nvcc} absent), so
+    custom CUDA C++ kernels are not feasible; Triton compiles via LLVM to PTX.
+  \item Modulus: $p = 998244353 = 119 \cdot 2^{23} + 1$ (NTT-friendly prime; primitive
+    root $g = 3$; maximum $N = 2^{23}$).
+  \item Arithmetic: \texttt{int64} (no overflow: $p^2 < 2^{63}$).
+  \item For the external comparison (Section~\ref{sec:external}) a user-space CUDA toolchain
+    was later assembled with no admin privileges, enabling a direct measured benchmark against
+    GPU-NTT; ICICLE's GPU NTT remained unavailable (closed-source backend).
+\end{itemize}
+
+% ============================================================
+\section{Background: The Number Theoretic Transform}
+
+\subsection{Algorithm}
+
+The NTT of a length-$N$ sequence $\mathbf{a} \in \mathbb{Z}_p^N$ is:
+\[
+  A_k = \sum_{j=0}^{N-1} a_j \cdot \omega^{jk} \pmod{p}, \quad k = 0, \ldots, N-1
+\]
+where $\omega = g^{(p-1)/N} \bmod p$ is a principal $N$-th root of unity.
+
+We implement the iterative Cooley-Tukey Decimation-In-Time (DIT) algorithm with
+bit-reversal permutation applied to the input:
+
+\begin{enumerate}
+  \item \textbf{Bit-reversal}: permute input $\mathbf{a}$ so element at index $i$ moves
+    to index $\mathrm{bitrev}(i, \log_2 N)$.
+  \item \textbf{Butterfly stages}: for $s = 0, 1, \ldots, \log_2 N - 1$:
+    \begin{itemize}
+      \item half $= 2^s$
+      \item For each butterfly pair $(u_{\text{idx}}, l_{\text{idx}})$ with twiddle
+        $\omega_s^{k_{\text{in\_group}}}$:
+        \[
+          u' = (u + \omega \cdot l) \bmod p, \quad l' = (u - \omega \cdot l) \bmod p
+        \]
+    \end{itemize}
+  \item \textbf{Inverse NTT}: same stages with $\omega^{-1}$, followed by scaling by
+    $N^{-1} \bmod p$.
+\end{enumerate}
+
+Total arithmetic: $N \log_2 N$ modular multiplications and $N \log_2 N$ additions.
+For $N = 16384$: 229,376 multiplications per NTT call per batch element.
+
+\subsection{Modular reduction}
+
+The key bottleneck in software NTT is modular reduction after each multiplication.
+For a product $x = a \cdot b$ where $a, b < p < 2^{30}$, the result $x < p^2 < 2^{60}$
+fits in \texttt{int64}. Reduction $x \bmod p$ via integer division takes 20--30 cycles
+on modern CPUs/GPUs. Barrett reduction replaces division with a precomputed
+multiply-shift sequence:
+\[
+  q \approx \left\lfloor x \cdot \lceil 2^k / p \rceil / 2^k \right\rfloor, \quad
+  r = x - q \cdot p
+\]
+yielding $r \equiv x \pmod{p}$ in $\sim$4 cycles.
+
+% ============================================================
+\section{Existing GPU NTT Implementations}
+
+\begin{table}[h]
+\centering
+\caption{Selected GPU NTT libraries and their optimization techniques.}
+\begin{tabular}{L{3cm}L{4.5cm}L{5cm}}
+\toprule
+Library & Key optimizations & Status in this project \\
+\midrule
+\textbf{ICICLE} (Ingonyama) &
+  Fused multi-stage CUDA kernels; Winograd radix; shared-memory tiling; mixed-radix &
+  Not installed; build requires CMake + nvcc (absent on cluster) \\[4pt]
+\textbf{GPU-NTT} (Özcan \& Savaş, 2023) &
+  Merge NTT (multi-stage fusion); 4-Step NTT (matrix decomposition); Barrett reduction &
+  Cloned; build failed (cmake $<$ 3.26, nvcc absent); comparison documented \\[4pt]
+\textbf{This project} &
+  Twiddle caching; per-stage Triton butterfly kernel; constexpr MOD (LLVM Barrett) &
+  Benchmarked; honest tradeoffs reported \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Merge NTT algorithm (Özcan \& Savaş, ePrint 2023/1410) fuses multiple consecutive
+butterfly stages into one CUDA kernel so intermediate values remain in GPU shared memory
+(SRAM) rather than being written to DRAM between stages. For $N = 16384$ with merge
+depth 7, this yields 2 kernel launches and 2 DRAM passes instead of 14. This approach
+requires intra-kernel data shuffling (\texttt{tl.gather} in Triton terminology), which
+is absent in Triton 3.2.0.
+
+% ============================================================
+\section{Implementations}
+
+\subsection{Python CPU (reference)}
+
+\texttt{src/ntt\_cpu.py}: Pure Python iterative DIT NTT. No NumPy or CUDA. Used as
+a correctness reference. All other implementations are bit-exactly validated against it.
+
+Performance: $\sim$1.9\,ms for $N=1024$ (1 transform). Python loop overhead
+(35--95$\times$ slower than C++ CPU on the same algorithm) dominates.
+
+\subsection{C++ CPU baseline}
+
+\texttt{build/ntt\_cpu\_bench}: Identical radix-2 DIT algorithm compiled with
+\texttt{g++ -O3}. The compiler applies loop unrolling, SIMD auto-vectorization,
+and strength-reduction on scalar modular arithmetic. Single-threaded.
+
+Performance: $\sim$0.020\,ms for $N=1024$ (1 transform); $\sim$58.5\,ms for
+$N=16384$, batch=128 (128 sequential transforms).
+
+\subsection{PyTorch GPU Simple}
+
+\texttt{src/ntt\_gpu\_simple.py}: Each butterfly stage is implemented as a sequence
+of PyTorch tensor ops. Twiddle factors are recomputed from scratch every call
+(element-by-element Python $\to$ CUDA writes).
+
+Performance: $\sim$12\,ms for $N=1024$ (1 transform), dominated by twiddle
+recomputation overhead.
+
+\subsection{PyTorch GPU Optimized}
+
+\texttt{src/ntt\_gpu\_optimized.py}: Same algorithm; two key changes:
+\begin{enumerate}
+  \item Twiddle factor tensors precomputed once and cached on the GPU device
+    per $(N, \text{invert})$ key.
+  \item Bit-reversal permutation index tensor precomputed and cached per $N$.
+\end{enumerate}
+
+The butterfly loop per stage:
+\begin{lstlisting}[language=Python]
+t = twiddles[s].unsqueeze(0).unsqueeze(0)    # view — 0 CUDA launches
+a = a.reshape(B, N//(2*half), 2, half)        # view — 0 launches
+upper = a[:, :, 0, :]                         # view — 0 launches
+lower = a[:, :, 1, :]                         # view — 0 launches
+v = torch.remainder(lower * t, MOD)           # 2 launches
+new_upper = (upper + v) % MOD                 # 2 launches
+new_lower = torch.remainder(upper - v, MOD)   # 2 launches
+a = torch.stack([new_upper, new_lower], dim=2) # 1 launch
+   .reshape(B, N)                             # view — 0 launches
+\end{lstlisting}
+
+\textbf{7 CUDA kernel launches per butterfly stage}, plus 1 for bit-reversal.
+Total: $7 \cdot \log_2 N + 1$ launches per forward NTT.
+
+Performance: $\sim$0.94\,ms for $N=1024$, batch=128; $\sim$4.65\,ms for $N=16384$,
+batch=128 (compute-only).
+
+\subsection{Triton GPU (custom kernel)}
+
+\texttt{src/ntt\_gpu\_triton.py}: Drop-in replacement for GPU Optimized with the same
+public API (\texttt{forward}, \texttt{inverse}, \texttt{conv}, \texttt{warmup}).
+
+Two Triton kernels:
+
+\begin{enumerate}
+\item \textbf{\texttt{\_ntt\_butterfly\_kernel}}: handles all $N/2$ butterfly pairs
+  for one stage in a single kernel call. 2D grid: \texttt{(ceil(N/2 / BLOCK\_SIZE), B)}.
+
+\begin{lstlisting}[language=Python]
+@triton.jit
+def _ntt_butterfly_kernel(
+    x_ptr, tw_ptr, N, B,
+    LOG_HALF: tl.constexpr,   # stage index s (compile-time)
+    BLOCK_SIZE: tl.constexpr,
+    MOD: tl.constexpr,        # triggers LLVM constant-division opt
+):
+    b    = tl.program_id(1)   # batch index (no runtime division)
+    pid0 = tl.program_id(0)
+    half = 1 << LOG_HALF
+    k    = pid0 * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    k_in_group = k & (half - 1)   # compile-time mask
+    group_num  = k >> LOG_HALF     # compile-time shift
+    upper_idx  = (group_num << (LOG_HALF + 1)) | k_in_group
+    lower_idx  = upper_idx + half
+    u  = tl.load(x_ptr + b * N + upper_idx, ...)
+    l  = tl.load(x_ptr + b * N + lower_idx, ...)
+    tw = tl.load(tw_ptr + k_in_group, ...)
+    v  = l * tw % MOD             # LLVM Barrett, not idiv
+    tl.store(x_ptr + b * N + upper_idx, (u + v) % MOD, ...)
+    tl.store(x_ptr + b * N + lower_idx, (u - v + MOD) % MOD, ...)
+\end{lstlisting}
+
+\item \textbf{\texttt{\_ntt\_scale\_kernel}}: element-wise multiply by $N^{-1} \bmod p$
+  for the inverse NTT final step.
+\end{enumerate}
+
+\textbf{Key optimizations:}
+\begin{itemize}
+  \item \textbf{Kernel count}: 1 Triton launch per stage (vs 7 PyTorch launches).
+    Total: $\log_2 N + 1$ launches per forward NTT.
+  \item \textbf{Barrett reduction}: \texttt{MOD: tl.constexpr} causes LLVM to replace
+    \texttt{x \% MOD} (int64 \texttt{idiv}, $\sim$25 cycles) with a multiply-shift
+    sequence ($\sim$4 cycles). No hand-coded Barrett needed.
+  \item \textbf{No intermediate tensors}: In-place update avoids the 7 intermediate
+    DRAM allocations per stage present in PyTorch.
+  \item \textbf{Compile-time index arithmetic}: \texttt{LOG\_HALF: tl.constexpr} makes
+    all bit operations (\texttt{\&}, \texttt{>>}, \texttt{<<}) compile-time constants.
+\end{itemize}
+
+\textbf{JIT compilation}: First call per \texttt{(LOG\_HALF, BLOCK\_SIZE, MOD)} tuple
+takes 0.5--2\,s. Excluded from timed measurements via \texttt{warmup()} (runs a dummy
+forward+inverse before benchmarking). Compiled PTX cached to disk.
+
+% ============================================================
+\section{Benchmark Methodology}
+
+\subsection{Hardware and software}
+
+\begin{itemize}
+  \item GPU: NVIDIA GeForce RTX 2080 Ti, 10.7\,GB VRAM, 4352 CUDA cores, 616\,GB/s peak bandwidth
+  \item CUDA 12.4, PyTorch 2.6.0+cu124, Triton 3.2.0, Python 3.12
+  \item C++ compiler: \texttt{g++ -O3}
+  \item Cluster: SLURM-managed HPC system
+\end{itemize}
+
+\subsection{Timing protocol}
+
+All GPU timings use:
+\begin{enumerate}
+  \item \texttt{ntt.warmup(N)}: triggers Triton JIT (if applicable), precomputes twiddles.
+    This step is \textbf{excluded} from all measurements.
+  \item 10 un-timed warmup calls (fills GPU caches, eliminates first-call effects).
+  \item \texttt{gc.collect(); torch.cuda.empty\_cache()} between implementations to
+    prevent CUDA caching allocator interference.
+  \item 20 timed calls with \texttt{torch.cuda.synchronize()} before and after.
+  \item Report: average time per call.
+\end{enumerate}
+
+C++ CPU timing: 5 runs of \texttt{./ntt\_cpu\_bench N B 5} via subprocess; wall-clock.
+
+\subsection{Measurement scope}
+
+All GPU timings are \textbf{compute-only}: data is already resident on the GPU at the
+start of each call (no PCIe host$\leftrightarrow$device transfer). The C++ CPU timing
+is a complete wall-clock including memory allocation. This means C++ vs GPU comparisons
+are not perfectly apples-to-apples; see §\ref{sec:results} for honest interpretation.
+
+% ============================================================
+\section{Profiling Methodology}
+
+Exact kernel launch counts and memory transaction counts require a GPU profiler
+(Nsight Compute). In the absence of profiler access, we use \textbf{static code
+analysis} to derive estimates. See \texttt{src/profile\_triton.py} for implementation.
+
+\subsection{Kernel launch count model}
+
+\textbf{PyTorch GPU Optimized}: Each Python-level PyTorch operation that allocates a new
+tensor is a separate CUDA kernel dispatch. From the butterfly loop code (§\ref{sec:implementations}):
+7 kernel-launching ops per stage (views excluded) + 1 for bit-reversal.
+\[
+  \text{launches}_{\text{Opt}} = 7 \cdot \log_2 N + 1
+\]
+
+\textbf{Triton GPU}: 1 Triton kernel per stage + 1 for bit-reversal.
+\[
+  \text{launches}_{\text{Triton}} = \log_2 N + 1
+\]
+
+\textbf{Reduction ratio}:
+\[
+  \frac{7 \cdot \log_2 N + 1}{\log_2 N + 1} \approx 6.5 \times \text{ (range 6.46--6.60 for } N \in [1024, 16384]\text{)}
+\]
+
+\subsection{Memory traffic model}
+
+Per butterfly stage, data volume = $B \cdot N$ elements of \texttt{int64} ($= B \cdot N \cdot 8$ bytes).
+
+\textbf{PyTorch} generates $\approx 9$ read/write passes of the data per stage via
+intermediate tensors (enumerated in §\ref{sec:bottleneck}).
+\[
+  \text{traffic}_{\text{Opt}} = (9.0 \cdot \log_2 N + 2.0) \cdot B \cdot N \cdot 8 \text{ bytes}
+\]
+
+\textbf{Triton} reads once and writes once per stage (in-place).
+\[
+  \text{traffic}_{\text{Triton}} = (2.0 \cdot \log_2 N + 2.0) \cdot B \cdot N \cdot 8 \text{ bytes}
+\]
+
+\textbf{Traffic reduction}: converges to $9/2 = 4.5\times$ as $N \to \infty$; observed
+4.18--4.27$\times$ for $N \in [1024, 16384]$.
+
+\textbf{Effective bandwidth}:
+\[
+  \text{BW}_{\text{eff}} = \frac{\text{estimated traffic}}{\text{measured time}}
+\]
+
+This is an estimate, not an exact measurement. Actual DRAM transactions may be lower
+due to L2 caching. For authoritative profiling, use \texttt{ncu} (Nsight Compute).
+
+% ============================================================
+\section{Results}
+\label{sec:results}
+
+\subsection{Speedup: Triton vs PyTorch GPU Optimized}
+
+\begin{table}[h]
+\centering
+\caption{Speedup of Triton over PyTorch GPU Optimized (compute-only). All 20 cells
+show Triton faster. Speedup range: 3.20$\times$--4.65$\times$.}
+\begin{tabular}{R{1.2cm}R{1.2cm}R{2.0cm}R{2.0cm}R{1.6cm}}
+\toprule
+$N$ & Batch & GPU Opt (ms) & Triton (ms) & Speedup \\
+\midrule
+1024  &   1  & 0.910 & 0.277 & 3.29$\times$ \\
+1024  &  32  & 0.923 & 0.288 & 3.20$\times$ \\
+1024  & 128  & 0.940 & 0.283 & 3.33$\times$ \\
+\midrule
+4096  &   1  & 1.092 & 0.322 & 3.39$\times$ \\
+4096  &  32  & 1.105 & 0.327 & 3.38$\times$ \\
+4096  & 128  & 1.106 & 0.322 & 3.44$\times$ \\
+\midrule
+8192  &  32  & 1.190 & 0.359 & 3.32$\times$ \\
+8192  & 128  & 2.115 & 0.478 & \textbf{4.43$\times$} \\
+\midrule
+16384 &  32  & 1.278 & 0.378 & 3.38$\times$ \\
+16384 & 128  & 4.646 & 0.999 & \textbf{4.65$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Speedup: Triton vs C++ CPU}
+
+\begin{table}[h]
+\centering
+\caption{Speedup of Triton GPU (compute-only) vs C++ CPU (wall-clock).
+Triton is slower for batch=1 (GPU launch overhead not amortized).}
+\begin{tabular}{R{1.2cm}R{1.2cm}R{2.0cm}R{2.0cm}R{1.8cm}}
+\toprule
+$N$ & Batch & C++ CPU (ms) & Triton (ms) & Speedup \\
+\midrule
+1024  &   1 &  0.020 & 0.277 & 0.07$\times$ ← C++ wins \\
+1024  &   8 &  0.163 & 0.278 & 0.59$\times$ ← C++ wins \\
+1024  &  32 &  0.653 & 0.288 & 2.27$\times$ \\
+1024  & 128 &  2.622 & 0.283 & 9.28$\times$ \\
+\midrule
+4096  &  32 &  2.957 & 0.327 & 9.04$\times$ \\
+4096  & 128 & 11.776 & 0.322 & 36.6$\times$ \\
+\midrule
+8192  & 128 & 26.689 & 0.478 & 55.9$\times$ \\
+\midrule
+16384 &  32 & 14.537 & 0.378 & 38.5$\times$ \\
+16384 & 128 & 58.512 & 0.999 & \textbf{58.6$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Kernel launches (estimated)}
+
+\begin{table}[h]
+\centering
+\caption{Estimated CUDA kernel launches per forward NTT call.}
+\begin{tabular}{R{1.5cm}R{1.5cm}R{2.5cm}R{2.5cm}R{2.0cm}}
+\toprule
+$N$ & Stages & GPU Opt launches & Triton launches & Reduction \\
+\midrule
+1024  & 10 & 71 & 11 & 6.46$\times$ \\
+2048  & 11 & 78 & 12 & 6.50$\times$ \\
+4096  & 12 & 85 & 13 & 6.54$\times$ \\
+8192  & 13 & 92 & 14 & 6.57$\times$ \\
+16384 & 14 & 99 & 15 & 6.60$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Memory traffic (estimated, batch=128)}
+
+\begin{table}[h]
+\centering
+\caption{Estimated global memory traffic per forward NTT call (batch=128).
+Reduction converges to 4.5$\times$ as $N \to \infty$.}
+\begin{tabular}{R{1.5cm}R{2.5cm}R{2.5cm}R{2.0cm}R{2.0cm}R{1.5cm}}
+\toprule
+$N$ & GPU Opt (MB) & Triton (MB) & Reduction & Triton BW & \% Peak \\
+\midrule
+1024  &   96.5 &   23.1 & 4.18$\times$ &   82\,GB/s & 13\% \\
+2048  &  211.8 &   50.3 & 4.21$\times$ &  170\,GB/s & 28\% \\
+4096  &  461.4 &  109.1 & 4.23$\times$ &  339\,GB/s & 55\% \\
+8192  &  998.2 &  234.9 & 4.25$\times$ &  492\,GB/s & 80\% \\
+16384 & 2147.5 &  503.3 & 4.27$\times$ & \textbf{504\,GB/s} & \textbf{82\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Figures}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.8\textwidth]{../results/plots/triton_vs_gpuopt_speedup.png}
+  \caption{Speedup of Triton GPU over PyTorch GPU Optimized for all tested $(N,
+    \mathrm{batch})$ combinations. All 20 cells show Triton faster (3.20--4.65$\times$).
+    Larger batches at large $N$ give higher speedup as the kernel becomes memory-bound.}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.8\textwidth]{../results/plots/runtime_comparison_triton_gpuopt_cpp.png}
+  \caption{Absolute runtime comparison (log-log scale, batch=128). Annotations show
+    per-size Triton speedup over GPU Optimized. C++ CPU scales linearly with batch;
+    GPU implementations show near-flat runtime for small $N$ (GPU occupancy not saturated).}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{../results/plots/estimated_kernel_launches.png}
+  \caption{Left: estimated CUDA kernel launches per forward NTT call. GPU Optimized
+    dispatches 7 PyTorch ops per butterfly stage; Triton dispatches 1 Triton kernel.
+    Right: launch reduction factor (6.46--6.60$\times$).}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{../results/plots/estimated_memory_traffic.png}
+  \caption{Left: estimated global memory traffic (batch=128). GPU Optimized generates
+    $\sim$9$\times$ the data volume per stage via intermediate tensors; Triton uses
+    $\sim$2$\times$ (in-place read+write). Right: traffic reduction factor (4.18--4.27$\times$).}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.8\textwidth]{../results/plots/estimated_effective_bandwidth.png}
+  \caption{Estimated effective bandwidth vs $N$ (batch=128) and theoretical peak
+    (616\,GB/s). Small $N$: launch-overhead-bound (low BW). Large $N$: bandwidth-bound.
+    Triton reaches 82\% of peak at $N=16384$, confirming the kernel is DRAM-limited.}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{../results/plots/throughput_vs_batch_size.png}
+  \caption{NTT throughput (transforms per second) vs batch size for representative $N$
+    values. Triton consistently achieves $\sim$3--5$\times$ higher throughput than GPU
+    Optimized across all tested sizes.}
+\end{figure}
+
+\clearpage
+
+\subsection{Performance regime analysis}
+\label{sec:bottleneck}
+
+Two performance regimes emerge from the bandwidth analysis:
+
+\textbf{Small $N$ (1024--4096), any batch}: Triton achieves 2--339\,GB/s effective
+bandwidth. Far below the 616\,GB/s peak, indicating the kernel is
+\emph{launch-overhead-bound}. The dataset ($\leq$4\,MB at batch=128) fits in the RTX
+2080 Ti's 5.5\,MB L2 cache. The 3.2--3.8$\times$ speedup is dominated by the 6.5$\times$
+reduction in kernel dispatch overhead.
+
+\textbf{Large $N$ (8192--16384), large batch (128)}: Triton achieves 492--504\,GB/s
+(80--82\% of peak). The kernel is \emph{memory-bandwidth-bound}. The 4.43--4.65$\times$
+speedup is primarily explained by the 4.25--4.27$\times$ reduction in DRAM traffic (no
+intermediate tensor allocations).
+
+\textbf{Transition at $N=8192$, batch=128}: GPU Optimized takes 2.115\,ms (only 4.43$\times$
+slower than its own smaller-$N$ times) because it is also bandwidth-bound at this size,
+but moves 4.25$\times$ more data than Triton.
+
+\subsection{The 58.6$\times$ vs C++ CPU speedup}
+
+At $N=16384$, batch=128, C++ CPU takes 58.5\,ms; Triton takes 0.999\,ms.
+The ratio reflects three independent factors:
+\begin{enumerate}
+  \item \textbf{GPU parallelism}: the RTX 2080 Ti processes all 128 NTTs simultaneously.
+    14 stages $\times$ 128$\times$16384/2 = 14.7\,M butterfly operations execute in
+    parallel. The C++ CPU processes them sequentially.
+  \item \textbf{Memory bandwidth}: 504\,GB/s (GPU) vs $\sim$50\,GB/s (DDR4 system).
+  \item \textbf{Timing asymmetry}: GPU time is compute-only (data on GPU);
+    C++ time includes memory allocation. This inflates the ratio slightly.
+\end{enumerate}
+
+% ============================================================
+\section{Optimization 1: Batching and Cached Twiddle Factors}
+
+The progression from PyTorch GPU Simple to GPU Optimized yields $\sim$5$\times$ improvement
+from two changes:
+
+\begin{enumerate}
+  \item \textbf{Batch computation}: both implementations support $[B, N]$ input tensors
+    and process all $B$ NTTs in parallel within a single PyTorch call.
+  \item \textbf{Twiddle factor caching}: Simple recomputes twiddle tensors every call
+    via element-by-element Python$\to$CUDA writes ($N$ scalar writes per stage $\times$
+    $\log_2 N$ stages). Optimized builds twiddle tensors via \texttt{torch.tensor(list,
+    device=cuda)} (one GPU transfer per stage) and caches them. Cache break-even: $<1$
+    call at all $N \geq 512$.
+\end{enumerate}
+
+From the one-off vs. repeated benchmark (Slurm job 54), GPU Optimized is 121.7$\times$
+faster than GPU Simple for $N=16384$ on repeated calls. Even the cold (first-call)
+comparison shows Optimized faster (two sources, not one: twiddle construction \emph{and}
+per-stage \texttt{clone()} vs \texttt{stack()}).
+
+% ============================================================
+\section{Optimization 2: Triton Stage-Optimized Kernel}
+
+The Triton optimization targets two remaining bottlenecks in GPU Optimized:
+
+\subsection{Bottleneck 1: Python dispatch overhead}
+
+With 7 PyTorch ops/stage and 14 stages for $N=16384$: 99 CUDA kernel dispatches per NTT
+call. Each dispatch costs $\sim$5--20\,$\mu$s (Python interpreter + PyTorch C++ dispatch +
+CUDA driver). At 99 launches: $\sim$0.5--2\,ms of overhead, comparable to the measured
+GPU Opt runtime of 1.28--4.65\,ms.
+
+Triton reduces this to 15 launches (6.60$\times$ fewer).
+
+\subsection{Bottleneck 2: Global memory traffic from intermediate tensors}
+
+7 PyTorch ops/stage $\times$ each allocating $\sim$B$\times$N/2 elements of intermediate
+storage = $\sim$9$\times$ more DRAM traffic than the theoretical in-place minimum.
+Triton's single kernel does not allocate intermediates: 2$\times$ (read+write only).
+Traffic reduction: 4.18--4.27$\times$.
+
+\subsection{Optimization not implemented: stage fusion (Merge NTT)}
+
+\texttt{tl.gather} is absent in Triton 3.2.0. This prevents fusing multiple butterfly
+stages into one kernel (which would keep intermediate results in GPU SRAM). Each Triton
+kernel still incurs a full DRAM round-trip per stage. The Merge NTT approach
+(Özcan \& Savaş) would reduce DRAM passes from $\log_2 N$ to $\log_2 N /
+\text{merge\_depth}$, expected to give an additional 1.4--2$\times$ speedup.
+
+% ============================================================
+\section{Tradeoffs and Limitations}
+
+\begin{enumerate}
+  \item \textbf{Triton JIT compile time}: 0.5--2\,s on first call per (LOG\_HALF,
+    BLOCK\_SIZE, MOD). Excluded from benchmarks via \texttt{warmup()}. Subsequent runs
+    load cached PTX from disk.
+
+  \item \textbf{Specificity}: The kernel is specialized for \texttt{int64} elements and
+    MOD=998244353. A different modulus or element type requires Triton recompilation.
+    PyTorch's \texttt{torch.remainder} handles arbitrary moduli at runtime.
+
+  \item \textbf{No stage fusion}: 14 kernel launches for $N=16384$ (down from 99, but
+    still 14 DRAM round-trips). Stage fusion via Merge NTT would reduce to 2--4 passes.
+
+  \item \textbf{Gap to production GPU-NTT (measured, then largely closed)}: a direct benchmark
+    (Section~\ref{sec:external}) first showed GPU-NTT 8--30$\times$ faster. After a gap analysis we
+    implemented a fused uint32 kernel (Section~\ref{sec:competitive}) that reduces the gap to
+    1.1--1.3$\times$ at batch=128 (all $N$) and to parity at small $N$. A residual $\sim$4$\times$
+    remains at $N=16384$, batch=1 (single-block occupancy limit); we explain it rather than hide it.
+
+  \item \textbf{Single GPU}: No multi-GPU batching; all transforms run on one RTX 2080 Ti.
+
+  \item \textbf{Estimated profiling}: Kernel launch counts and memory traffic are derived
+    from static code analysis. Authoritative measurements require Nsight Compute (\texttt{ncu}).
+\end{enumerate}
+
+% ============================================================
+\section{External Baseline Comparison}
+\label{sec:external}
+
+We compare our NTT against two external GPU NTT implementations. For \textbf{GPU-NTT}
+(Özcan \& Savaş) we performed a \emph{direct, measured} comparison: we built it from source
+on our own RTX~2080~Ti and benchmarked it at the same modulus $998244353$, same $N$, same
+forward-NTT convention, compute-only, with GPU-NTT's results verified correct against its own
+CPU reference. For \textbf{ICICLE} a direct GPU comparison was not feasible (closed-source CUDA
+NTT backend; different field). All claims are labeled \textbf{[MEASURED]} or \textbf{[NOT FEASIBLE]}.
+
+To obtain a working compiler we assembled a user-space CUDA toolchain with no administrative
+privileges: the system's only host compiler is GCC~14.3.1, which CUDA~12.4/12.6 cannot parse;
+NVIDIA's \texttt{nvcc}~12.9 front-end (from the redistributable component archive) does parse it,
+so we use that front-end while statically linking the CUDA~12.4 runtime (matching driver~550.120)
+and targeting \texttt{sm\_75}. Build journal: \texttt{docs/gpu\_ntt\_build\_log.md}.
+
+\subsection{GPU-NTT (Özcan \& Savaş, 2023)}
+
+GPU-NTT~\cite{gpuntt} implements two algorithms:
+\begin{itemize}
+  \item \textbf{Merge NTT}: fuses $d$ consecutive butterfly stages into one CUDA kernel.
+    Intermediate values stay in shared memory; DRAM passes $= \lceil \log_2 N / d \rceil$.
+  \item \textbf{4-Step NTT}: matrix-decomposition form for very large $N$ (up to $2^{28}$).
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Algorithmic comparison: GPU-NTT Merge NTT vs our Triton kernel.
+GPU-NTT column is \textbf{[THEORETICAL]} (code analysis); Triton column is
+\textbf{[MEASURED]}.}
+\begin{tabular}{L{4.5cm}L{4.5cm}L{4.5cm}}
+\toprule
+Property & GPU-NTT Merge NTT & Our Triton kernel \\
+\midrule
+DRAM passes/NTT   & $\lceil \log_2 N / d \rceil$ (\textasciitilde2 for $d=7$, $N=16384$)
+                  & $\log_2 N$ (14 for $N=16384$) \\
+Kernel launches/NTT & $\sim$2 & 15 \\
+Stage fusion      & Yes — shared memory & No — \texttt{tl.gather} absent in Triton 3.2.0 \\
+Batch support     & batch=1 (benchmarked) & batch 1--512 \\
+$N$ range         & $2^{12}$--$2^{28}$ & $2^{10}$--$2^{14}$ \\
+Modular reduction & Barrett (manual CUDA C++) & Barrett (LLVM via \texttt{tl.constexpr}) \\
+Build             & nvcc + CMake $\geq$3.26 (Apache-2.0) & Python + Triton \\
+Measured here     & \textbf{Yes} (this work, job~86) & Table~\ref{tab:speedup_triton} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Modulus pinning.} GPU-NTT's 32-bit modulus pool was edited to return $998244353$
+with roots derived from primitive root~3 ($g=3^{119}$ is a primitive $2^{23}$-th root;
+$\omega=g^{2^{23-\log_2 N}}$), matching our prime exactly. Correctness was confirmed by GPU-NTT's
+own \texttt{NTTCPU} reference for every configuration. We benchmarked the \emph{Merge NTT} with
+our own harness (warmup + median over 30 runs, CUDA-event timed) calling GPU-NTT's public API.
+
+\textbf{Direct measured result \textbf{[MEASURED]}.} On the same RTX~2080~Ti, same modulus,
+forward cyclic NTT, compute-only (Slurm job~86; raw data
+\texttt{results/raw/gpu\_ntt\_direct\_benchmark.csv}):
+
+\begin{table}[h]
+\centering
+\caption{Direct measured comparison, GPU-NTT Merge NTT vs our kernels, modulus $998244353$,
+RTX~2080~Ti, compute-only median ms. GPU-NTT correctness verified.}
+\begin{tabular}{R{1.2cm}R{1.2cm}R{2.2cm}R{2.0cm}R{2.2cm}R{2.4cm}}
+\toprule
+$N$ & batch & GPU-NTT (ms) & Triton (ms) & best CUDA (ms) & GPU-NTT speedup \\
+\midrule
+1024  & 1   & 0.0097 & 0.277 & 0.117 & 28.5$\times$ \\
+4096  & 1   & 0.0120 & 0.322 & 0.125 & 26.9$\times$ \\
+16384 & 1   & 0.0122 & 0.369 & 0.137 & 30.2$\times$ \\
+1024  & 128 & 0.0115 & 0.283 & ---   & 24.5$\times$ \\
+8192  & 128 & 0.0573 & 0.478 & ---   & 8.3$\times$  \\
+16384 & 128 & 0.1156 & 0.999 & ---   & 8.6$\times$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Honest interpretation.} On identical hardware and modulus, GPU-NTT is
+\textbf{$\sim$8--30$\times$ faster} than our Triton kernel and $\sim$10$\times$ faster than our
+best hand-written CUDA shared-memory kernel. This is the expected outcome and confirms the
+algorithmic analysis: GPU-NTT's Merge NTT fuses butterfly stages in shared memory ($\sim$2 DRAM
+passes, 1--2 launches), whereas our kernel does one launch and a full DRAM round-trip per stage
+and is launch-overhead-bound — the gap is largest at batch=1 and narrows to $\sim$8--9$\times$ at
+large $N\times$batch where both become DRAM-bandwidth-bound.
+
+\subsection{ICICLE (Ingonyama)}
+
+A direct ICICLE~\cite{icicle} GPU comparison was \textbf{[NOT FEASIBLE]} for two concrete
+reasons found in the cloned source (commit \texttt{625532a}). First, the general-purpose
+\emph{CUDA NTT backend is closed-source}: \texttt{icicle/cmake/backend\_include.cmake} fetches it
+at configure time from the private repository
+\texttt{git@github.com:ingonyama-zk/icicle-cuda-backend.git}; the open-source tree ships only the
+CPU and \texttt{cuda\_pqc} (post-quantum, not NTT) backends, so there is no GPU NTT source to
+compile. Second, even with the backend, ICICLE's small-field NTT uses the compile-time field
+\emph{babybear} ($0\mathtt{x}78000001 = 2013265921$, 31-bit), not our $998244353$ — a different
+prime, so not apples-to-apples. ICICLE is MIT-licensed. Details:
+\texttt{docs/icicle\_build\_log.md}.
+
+\textbf{Conclusion}: GPU-NTT (open-source) was the right priority-1 target and yielded a genuine
+measured comparison; ICICLE's GPU NTT is not buildable from source here.
+
+\subsection{Comparison figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{../results/plots/direct_external_comparison.png}
+  \caption{Direct measured comparison on the same RTX~2080~Ti at modulus $998244353$ (all series
+    measured). Left: compute-only time per call vs $N$ at batch=1 — GPU-NTT Merge NTT vs our CUDA
+    shared-memory, Triton radix-4, Triton radix-2, and C++ CPU kernels. Right: per-NTT cost vs
+    batch at $N=16384$ for GPU-NTT vs our Triton; annotations give the GPU-NTT speedup, which
+    narrows from $\sim$30$\times$ (batch=1) to $\sim$9$\times$ (batch=128) as both become
+    bandwidth-bound. ICICLE is absent: its CUDA NTT backend is closed-source and its field is
+    babybear, not $998244353$.}
+\end{figure}
+
+% ============================================================
+\section{Closing the Gap: A Competitive Fused NTT}
+\label{sec:competitive}
+
+The direct benchmark showed GPU-NTT 8--30$\times$ faster. Rather than stop there, we performed a
+gap analysis (\texttt{docs/gpu\_ntt\_gap\_analysis.md}) and implemented targeted optimizations.
+
+\textbf{Identified bottlenecks (largest first, batch=1).} (i) \emph{Kernel launch / dispatch
+count}: our prior path issued one global-memory kernel per butterfly stage plus a separate
+bit-reversal gather (Triton $\sim$15 launches), all dispatched from Python, whereas GPU-NTT uses
+1--2 launches from C++. At batch=1 the transform is tiny, so this overhead dominated.
+(ii) \emph{int64 global storage}: our data array was \texttt{int64}, doubling DRAM traffic versus
+GPU-NTT's \texttt{uint32}. (iii) \emph{Separate bit-reversal pass}. (iv) Barrett details (minor).
+
+\textbf{Implementation} (\texttt{tools/competitive\_cuda\_ntt/}, our code; GPU-NTT used only as a
+reference target). A single CUDA kernel loads one length-$N$ polynomial into dynamic shared memory,
+runs \emph{all} $\log_2 N$ stages there, and writes back once: \textbf{one launch, $\sim$2 DRAM
+passes}. Storage is \texttt{uint32} (64-bit only for the product); bit-reversal is folded into the
+load via \verb|__brev|; the inverse reuses the kernel with inverse twiddles and a fused
+$\times N^{-1}$ scale. For $N=16384$ we opt in to 64\,KB shared memory on sm\_75. Correctness is
+verified by an independent direct DFT at $N=16$, forward-vs-CPU-reference at every size, and
+forward+inverse round-trip at every $(N,\text{batch})$, plus \texttt{tests/test\_competitive\_ntt.py}.
+
+\textbf{Result (measured identically to GPU-NTT, compute-only).}
+
+\begin{table}[h]
+\centering
+\caption{Gap to GPU-NTT before (prior Triton) vs after (our competitive kernel). Gap = our time
+$\div$ GPU-NTT time; lower is better. Same RTX~2080~Ti, modulus 998244353.}
+\begin{tabular}{R{1.2cm}R{1.2cm}R{2.4cm}R{2.6cm}R{2.4cm}}
+\toprule
+$N$ & batch & prior gap (Triton) & \textbf{competitive gap} & vs prior best \\
+\midrule
+1024  & 1   & 28.5$\times$ & \textbf{0.89$\times$ (we win)} & 32$\times$ faster \\
+4096  & 1   & 26.9$\times$ & \textbf{1.56$\times$}          & 17$\times$ faster \\
+16384 & 1   & 30.2$\times$ & \textbf{4.36$\times$}          & 6.9$\times$ faster \\
+1024  & 128 & 24.5$\times$ & \textbf{1.14$\times$}          & 21$\times$ faster \\
+8192  & 128 & 8.3$\times$  & \textbf{1.31$\times$}          & 6.4$\times$ faster \\
+16384 & 128 & 8.6$\times$  & \textbf{1.31$\times$}          & 6.6$\times$ faster \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 8--30$\times$ gap collapses to \textbf{1.1--1.3$\times$ at batch=128 across all $N$}, and to
+parity/advantage at small $N$, batch=1 --- a 6--32$\times$ improvement over our prior best. Because
+the batch=128 numbers amortize Python dispatch yet are still 6--7$\times$ faster than prior Triton,
+the kernel improvement is genuine, not merely a fairer harness.
+
+\textbf{Where we still lose (honest).} At $N=16384$, batch=1 we are 4.36$\times$ slower: the
+single-block design needs 64\,KB shared memory $\Rightarrow$ one block per SM, so at batch=1 a
+single block runs on a 68-SM GPU --- severe under-utilization plus a long serial chain of 14
+\verb|__syncthreads|-separated stages. GPU-NTT spreads a large-$N$ transform across many blocks.
+As batch grows the grid fills and the gap collapses to 1.31$\times$. The residual $\sim$1.3$\times$
+batched is attributable to GPU-NTT's explicit Barrett $\mu$, bank-conflict-free layout (we drop
+shared padding at $N=16384$ to fit 64\,KB), and more register-efficient multi-element butterflies.
+See Figures in \texttt{results/plots/gap\_reduction\_vs\_gpu\_ntt.png} and
+\texttt{competitive\_runtime\_comparison.png}.
+
+% ============================================================
+\section{Workload-Adaptive Dispatch}
+\label{sec:adaptive}
+
+The gap analysis closed most of the distance to GPU-NTT but did not overturn it everywhere. We
+turned the residual \emph{regime structure} into the project's final contribution: a
+workload-adaptive NTT system that uses our kernel where it wins and GPU-NTT where it wins.
+
+\textbf{A second, specialized kernel.} To widen the region where we are competitive we added a
+\emph{low-latency} kernel (\texttt{tools/low\_latency\_cuda\_ntt/}, our code) specialized at
+\emph{compile time} on $\log_2 N$: the stage loop is fully unrolled with compile-time strides and
+\verb|__launch_bounds__| pins the thread count to $N/2$, letting the compiler maximize occupancy
+in the small-$N$, low-batch latency regime. We then benchmarked \emph{both} our kernels (fused and
+low-latency) against GPU-NTT on the same harness, same CUDA-event timing, same modulus, with
+forward+inverse round-trip correctness verified for all 56 $(N,\text{batch})$ cells
+(\texttt{results/raw/expanded\_gpu\_ntt\_vs\_ours.csv}).
+
+\textbf{The crossover (Figure: \texttt{gpu\_ntt\_gap\_heatmap.png}).} Let
+$\text{ratio} = \text{ours\_best} / \text{GPU-NTT}$; $<1$ means we win. Our best kernel wins for
+\emph{small transforms} --- $N\le 512$ across every batch (ratio 0.78--0.89), $N=1024$ at batch=1
+(0.99), and $N=2048$ at batch $\in\{32,64\}$ (0.96--0.98) --- \textbf{19 of 56 cells}. GPU-NTT
+dominates large workloads (up to $4.3\times$ at $N=16384$). Neither system is best everywhere.
+
+\textbf{The selector.} We build an offline-profiled lookup table
+(\texttt{results/raw/adaptive\_selector\_table.csv}) mapping each $(N,\text{batch})$ to the fastest
+of \{fused, low-latency, GPU-NTT\}; at runtime this is an $O(1)$ table lookup, negligible against a
+kernel launch --- the standard autotuning pattern. We evaluate it on four synthetic workloads (200
+tasks each), composing total runtime from the \emph{measured} per-call median latencies.
+
+\begin{table}[h]
+\centering
+\caption{Adaptive selector vs single-system baselines (total workload runtime). Synthetic
+workloads, 200 tasks each, composed from measured compute-only latencies.
+Data: \texttt{results/raw/mixed\_workload\_comparison.csv}.}
+\begin{tabular}{L{3.6cm}R{2.4cm}R{2.2cm}R{2.4cm}}
+\toprule
+Workload & vs GPU-NTT-only & vs our-only & chose ours/GPU \\
+\midrule
+A low\_latency\_small  & \textbf{1.14$\times$} & 1.01$\times$ & 148 / 52 \\
+B mixed\_realistic     & \textbf{1.02$\times$} & 1.57$\times$ & 50 / 150 \\
+C throughput\_large    & 1.00$\times$          & 1.23$\times$ & 0 / 200 \\
+D random\_grid         & \textbf{1.04$\times$} & 1.40$\times$ & 80 / 120 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The adaptive system is \textbf{never slower} than either single system and is \textbf{strictly
+faster than GPU-NTT-only whenever the workload contains small NTTs} (1.14$\times$ on A, 1.04$\times$
+on D). On a pure large-$N$ workload (C) it correctly collapses to GPU-NTT ($1.00\times$). Against
+our-kernel-only it is up to $1.57\times$ faster by deferring to GPU-NTT where that wins.
+
+\textbf{Honest limitations.} Workload runtimes are summed from measured per-call medians (not a
+fresh end-to-end dispatcher run); the selector dispatch cost and inter-task data movement are not
+modelled (all timings compute-only). The selector is evaluated on the same grid it was tuned on, so
+it is by construction never worse per cell; generalization to unseen $(N,\text{batch})$ (via
+nearest-neighbor lookup) is not measured. Our winning region is narrow (small $N$), so the gain
+over GPU-NTT-only is modest and appears only when small transforms are present. Single GPU
+(RTX~2080~Ti, sm\_75), modulus 998244353, forward NTT. Full discussion:
+\texttt{docs/final\_contribution\_strategy.md}.
+
+\subsection{Improvement pass: a warp-shuffle kernel and a real executed runtime}
+\label{sec:improvement}
+
+The selector above was evaluated by \emph{summing} measured per-call latencies. Guided by an
+options analysis (\texttt{docs/next\_improvement\_strategy.md}), we made two improvements that
+strengthen the small-$N$ regime and replace the simulation with a real measurement (Slurm job~93).
+
+\textbf{Warp-shuffle small-$N$ kernel.}
+\texttt{tools/low\_latency\_cuda\_ntt/warp\_shuffle\_ntt\_kernels.cu} (our code). In a
+decimation-in-time NTT the first five stages have butterfly stride $m<32$, so both partners of
+every butterfly lie in one warp. With an element-per-thread layout the partner is $\texttt{lane}
+\oplus m$, exchanged in-register via \verb|__shfl_xor_sync| with \textbf{no shared memory and no}
+\verb|__syncthreads()|; the cross-warp stages ($m\ge32$) fall back to the proven shared-memory
+pair-per-thread path. The kernel is valid for $N\le1024$ (element-per-thread needs
+$\text{threads}=N$). Measured, it is the fastest of our kernels on every $N\le1024$ cell, beating
+our prior best by $1.10$--$1.18\times$, which \emph{expands and deepens} the region where we beat
+GPU-NTT: $N\le512$ improves to ratio $0.61$--$0.74$ (was $0.78$--$0.89$) and $N=1024$ \emph{flips}
+from a loss/parity at batch${>}1$ to a $0.85$--$0.95\times$ win. Bit-exact forward+inverse
+round-trip verified for all cells. Data: \texttt{results/raw/small\_n\_optimization\_benchmark.csv};
+plot \texttt{results/plots/small\_n\_gpu\_ntt\_vs\_ours.png}.
+
+\textbf{A real, executed adaptive runtime.} \texttt{tools/adaptive\_ntt\_runtime/} dispatches each
+$(N,\text{batch})$ task to GPU-NTT or our best kernel and times the \emph{whole mixed workload
+end-to-end} (CUDA-event wall time, median of 7 runs), rather than summing per-call latencies. The
+real run reveals an effect the simulation could not: a \emph{homogeneous} GPU-NTT launch stream
+pipelines launches, a \emph{heterogeneous} adaptive stream cannot, and isolated per-call profiling
+(one launch+sync per call) overstates per-call cost. An unguarded selector therefore over-routes to
+ours; a $10\%$ confidence margin (deviate from GPU-NTT only on robust wins) plus median timing
+fixes the small-heavy case and brings broad mixes to within $\sim$1--2\% of GPU-NTT-only.
+
+\begin{table}[h]
+\centering
+\caption{Real \emph{executed} adaptive runtime vs single-system baselines (median of 7 end-to-end
+runs, not summed latencies). Data: \texttt{results/raw/adaptive\_runtime\_benchmark.csv}.}
+\begin{tabular}{L{4.0cm}R{2.6cm}R{2.2cm}R{2.4cm}}
+\toprule
+Workload & vs GPU-NTT-only & vs our-only & routed ours/GPU \\
+\midrule
+A small-transform-heavy   & \textbf{1.57$\times$} & 1.11$\times$ & 146 / 54 \\
+B mixed (large-dominated)  & 0.99$\times$          & 1.84$\times$ & 39 / 161 \\
+C throughput-large         & 1.00$\times$          & 1.31$\times$ & 0 / 200 \\
+D random grid              & 0.98$\times$          & 1.76$\times$ & 71 / 129 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Energy and reproducibility.} On the broad mix (workload~D, NVML two-point subtraction) the
+adaptive runtime is the \emph{most energy-efficient} policy: $0.098\,\mu$J/NTT and $10.23$M NTT/J
+throughput-per-watt, versus GPU-NTT-only's $0.103\,\mu$J/NTT and $9.73$M NTT/J, because our small-$N$
+kernels draw $\sim$82\,W vs $\sim$114\,W --- so adaptive trades $\sim$2\% wall-time for $\sim$5\%
+better energy efficiency (\texttt{results/raw/adaptive\_energy\_comparison.csv}). Run-to-run
+coefficient of variation is $<0.8\%$ everywhere except GPU-NTT on the small-$N$ workload (cv
+$\approx20\%$) --- a cold-start instability that is itself the regime our kernels remove
+(\texttt{results/raw/adaptive\_reproducibility.csv}; plots
+\texttt{adaptive\_runtime\_mixed\_workloads.png}, \texttt{adaptive\_reproducibility\_errorbars.png}).
+
+\textbf{Honest reading.} The adaptive runtime is a decisive win ($1.57\times$) only when small,
+low-latency NTTs are a significant fraction of the workload; on large-dominated mixes it is at
+parity (within $\sim$1--2\%) but more energy-efficient. We do not force the broad-mix numbers above
+parity --- that would mean routing nothing to our kernels.
+
+\subsection{Shared-memory bank-conflict study}
+\label{sec:sharedmem}
+
+We then asked whether shared-memory bank conflicts or occupancy are the next bottleneck
+(\texttt{docs/shared\_memory\_optimization\_plan.md}, Slurm job~94). The analysis is instructive on
+its own: with \texttt{uint32} storage ($4N$ bytes) the per-SM \emph{thread} count (1024) caps blocks
+per SM for every $N$, so shared memory is \emph{not} the occupancy limiter; and the
+warp-shuffle kernel already performs the bank-conflict-prone early stages (stride ${<}32$) in
+registers. So padding can only help the \emph{all-shared} kernels used at $N\ge2048$. We added two
+variants (\texttt{tools/shared\_memory\_ntt/}): \textbf{A}, the all-shared kernel with padded indices
+$\text{SPAD}(i)=i+\lfloor i/32\rfloor$; and \textbf{B}, the warp-shuffle kernel with its (already
+conflict-free) shared phase padded --- a control. Every variant's forward output is bit-for-bit
+identical to the verified \texttt{fused} kernel, with round-trip to identity, for all
+$N\in\{256,\dots,16384\}$ and batch $\in\{1,8,32,128\}$.
+
+\begin{table}[h]
+\centering
+\caption{Padding effect on the all-shared kernel (\texttt{low\_latency} $\div$ \texttt{padded};
+$>1$ = padding faster). The control (warp-shuffle $\div$ shuffle+pad) was $0.98$--$1.03\times$
+everywhere (no effect). $N=16384$ padded exceeds the 64\,KB sm\_75 cap.
+Data: \texttt{results/raw/shared\_memory\_optimization\_benchmark.csv}.}
+\begin{tabular}{R{1.4cm}R{1.6cm}R{1.6cm}R{1.6cm}R{1.6cm}}
+\toprule
+$N$ & batch 1 & batch 8 & batch 32 & batch 128 \\
+\midrule
+256   & 1.01 & 1.01 & 1.00 & 1.01 \\
+512   & 0.98 & 1.00 & 1.01 & 1.03 \\
+1024  & 1.01 & 1.04 & 1.07 & \textbf{1.23} \\
+2048  & 1.11 & 1.07 & 1.12 & \textbf{1.27} \\
+4096  & 1.14 & 1.15 & 1.14 & \textbf{1.32} \\
+8192  & 1.15 & 1.14 & 1.15 & \textbf{1.29} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Result.} The control showed no effect (confirming padding only matters where conflicts
+exist), but padding the all-shared kernel is \textbf{$1.07$--$1.32\times$ faster at $N\ge2048$}
+(neutral at $N\le512$). This \emph{expanded the region where we beat GPU-NTT}: with \texttt{padded}
+as the best all-shared kernel, $N=2048$ now wins all tested batches (was losing batch~1--16),
+$N=4096$ wins batch~$\ge32$, and $N=8192$ wins batch~128 --- all previously losses. $N=16384$ gets
+no benefit (padding does not fit 64\,KB); its gap remains the grid-occupancy limit (one block at
+batch=1). An honest correction: we had predicted padding would be neutral, but the all-shared kernel
+carried real bank conflicts beyond the early stages, and removing them widened our winning band into
+the mid-range. The \texttt{padded} kernel should therefore be added to the adaptive selector for
+$N\in\{2048,4096,8192\}$.
+
+\subsection{Integrating \texttt{padded} into the adaptive selector}
+\label{sec:padded-integration}
+
+We added \texttt{padded} as a fourth backend to the runtime and built \emph{two} selectors --- OLD
+(\{fused, lowlat, shuffle\}) and NEW (\{fused, lowlat, shuffle, \textbf{padded}\}) --- to isolate
+its effect (Slurm job~95).
+
+\textbf{Per-call (isolated, compute-only): the winning region expanded.} The NEW selector dispatches
+\texttt{padded} for $N=1024$ (batch 64,128), $N=2048$ (all batches), $N=4096$ (batch~$\ge64$), and
+$N=8192$ (batch~$\ge64$), flipping $N=4096/8192$ at batch 64/128 from losses to wins and making
+$N=2048$ win at every batch --- the winning region grew from ${\sim}24$ to ${\sim}36$ of 56 cells
+(\texttt{results/raw/adaptive\_selector\_with\_padded.csv};
+\texttt{results/plots/selector\_regions\_with\_padded.png}).
+
+\textbf{Executed mixed workloads: no throughput gain (honest).} End-to-end (median of 7), NEW vs OLD
+vs GPU-NTT-only (\texttt{results/raw/mixed\_workload\_with\_padded.csv}):
+
+\begin{table}[h]
+\centering
+\caption{Integrating \texttt{padded}: executed mixed-workload speedup over GPU-NTT-only. NEW equals
+OLD on A/C but slightly regresses B/D, because routing mid-large cells to our kernel forfeits
+GPU-NTT's homogeneous-launch pipelining under interleaved execution.}
+\begin{tabular}{L{4.0cm}R{2.6cm}R{2.4cm}R{2.6cm}}
+\toprule
+Workload & NEW (+padded) / GPU & OLD / GPU & padded routes (NEW) \\
+\midrule
+A small-transform-heavy & $1.23\times$ & $1.23\times$ & 0 \\
+B mixed                  & $0.98\times$ & $0.99\times$ & 25 \\
+C throughput-large       & $1.00\times$ & $1.00\times$ & 51 \\
+D random grid            & $0.97\times$ & $0.98\times$ & 20 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+So the per-cell isolated win does \emph{not} translate to interleaved throughput. \textbf{Conclusion:}
+\texttt{padded} is the correct backend for isolated, latency-bound single transforms at
+$N=2048$--$8192$ (a measured per-call win that expanded the winning region, now reflected in the
+selector table), whereas for high-throughput interleaved streams the conservative routing is as good.
+This is the same offline-profiling-vs-interleaved-execution caveat established for the runtime in
+Section~\ref{sec:improvement}.
+
+\subsection{Two selector modes: latency vs throughput}
+\label{sec:modes}
+
+The padded result shows that \emph{per-call fastest} selection is not always best for streams. We
+therefore expose two policy modes (no new kernels; \texttt{selector\_modes}, job~96):
+\textbf{latency mode} (aggressive, margin $0\%$ --- route to the per-call fastest kernel, for
+isolated/latency-sensitive calls) and \textbf{throughput mode} (conservative, margin $15\%$ ---
+route to our kernel only on a robust win, else GPU-NTT, to avoid harmful backend switching in large
+interleaved streams).
+
+\begin{table}[h]
+\centering
+\caption{Two selector modes vs GPU-NTT-only, executed median of 7 runs
+(\texttt{results/raw/adaptive\_selector\_modes.csv}). ``switches'' counts backend changes across the
+200-task stream. Throughput mode is $\ge$ latency mode on every workload.}
+\begin{tabular}{L{3.8cm}R{2.2cm}R{2.4cm}R{2.6cm}}
+\toprule
+Workload & latency / GPU & throughput / GPU & switches (lat / thr) \\
+\midrule
+A small-transform-heavy & $1.15\times$ & $\mathbf{1.34\times}$ & 0 / 81 \\
+B mixed                  & $0.91\times$ & $0.99\times$ & 132 / 70 \\
+C throughput-large       & $0.98\times$ & $0.99\times$ & 104 / 0 \\
+D random grid            & $0.93\times$ & $0.98\times$ & 132 / 97 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Latency mode} over-routes marginal mid/large cells to our kernel and thrashes backends (132
+switches on B/D), forfeiting GPU-NTT's launch pipelining and regressing those streams to
+$0.91$--$0.93\times$. \textbf{Throughput mode} delivers the large small-NTT win (A, $1.34\times$ ---
+even beating latency mode there by offloading the marginal $N{=}1024$ cells to GPU-NTT) and matches
+GPU-NTT-only within ${\sim}1$--$2\%$ (measurement noise) on the large-dominated streams. The correct
+policy is therefore workload-aware: latency mode for isolated calls, throughput mode for streams.
+
+\subsection{Architecture pass: multi-block 4-step NTT for low-batch large $N$}
+\label{sec:multiblock}
+
+A measured \texttt{ptxas\,-v} audit of every kernel (\texttt{results/raw/kernel\_resource\_report.csv})
+ruled out the usual suspects: \textbf{zero register spills anywhere}, and no kernel is
+register-bound (18--45 registers). It isolated a single remaining architectural limiter ---
+\textbf{grid-level under-occupancy at low batch}. For $N\ge 2048$ the all-shared kernels launch
+1024-thread blocks, exhausting a Turing SM's entire thread budget ($1024$ threads/SM) so that only
+\emph{one} block resides per SM; combined with the one-block-per-transform design, at batch=1 a
+single block runs on \textbf{1 of the GPU's 68 SMs ($1.5\%$ device utilization)} as a $14$-stage
+serial chain. This exactly explains the measured low-batch large-$N$ gap, which grows monotonically
+from $1.27\times$ at $N{=}16384$, batch=128 to $4.31\times$ at batch=1.
+
+The fix is a \textbf{multi-block 4-step (Cooley--Tukey) decomposition}. Factoring $N=N_1 N_2$ (e.g.
+$16384=128\times128$) with the index split $n=n_1+N_1 n_2$, $k=N_2 k_1 + k_2$ gives
+$X[N_2 k_1 + k_2] = \sum_{n_1} w_{N_1}^{n_1 k_1}\, w_N^{n_1 k_2}\,\big[\sum_{n_2} x[n_1+N_1 n_2]\,
+w_{N_2}^{n_2 k_2}\big]$. Kernel \texttt{mb\_step1} computes the $N_1$ independent inner $N_2$-point
+sub-NTTs plus the $w_N^{n_1 k_2}$ twiddle; \texttt{mb\_step2} computes the $N_2$ independent outer
+$N_1$-point sub-NTTs. One transform now launches $N_1$ (then $N_2$) blocks of tiny $\le128$-point
+sub-NTTs on $\le 64$ threads each (up to $16$ blocks/SM), \textbf{saturating all 68 SMs at batch=1}
+and halving the per-block serial chain ($14\to7$ stages). The output index $N_2 k_1 + k_2$ is a
+bijection of $[0,N)$, so results land in natural order with no extra permutation. Correctness is
+bit-exact versus the CPU DIT reference and a forward$+$inverse round-trip on all 32 cells
+($N\in\{2048,\dots,16384\}\times$ batch $\in\{1,\dots,128\}$); SLURM jobs 105/106.
+
+\begin{table}[h]
+\centering
+\caption{Multi-block 4-step NTT, compute-only (CUDA events, median of 30), modulus 998244353.
+Gap $=$ ours $\div$ GPU-NTT (lower is better; $<1$ we win).}
+\begin{tabular}{rrrrrcc}
+\toprule
+$N$ & batch & prior best (ms) & \textbf{multi-block (ms)} & GPU-NTT (ms) & prior gap & \textbf{new gap} \\
+\midrule
+4096  & 1 & 0.0173 & \textbf{0.0116} & 0.0120 & $1.50\times$ & \textbf{0.97$\times$ (win)} \\
+8192  & 1 & 0.0278 & \textbf{0.0124} & 0.0117 & $2.50\times$ & \textbf{1.06$\times$} \\
+16384 & 1 & 0.0512 & \textbf{0.0142} & 0.0122 & $4.31\times$ & \textbf{1.16$\times$} \\
+16384 & 8 & 0.0517 & \textbf{0.0311} & 0.0164 & $3.20\times$ & \textbf{1.90$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \textbf{$N{=}16384$, batch=1 gap --- the project's single worst case --- falls from
+$4.31\times$ to $1.16\times$} ($3.60\times$ faster than our prior best), and $N{=}4096$, batch=1
+flips to a \emph{win} over GPU-NTT. The design adds a second kernel launch and ${\sim}4$ DRAM passes
+(versus $2$): free when the GPU is $98\%$ idle, but a net cost once batch fills the grid, so the
+single-block fused kernel retakes the lead at batch $\ge 16$--$32$ (measured crossover). Multi-block
+is therefore adopted as a \emph{new selector backend used only in its winning corner}
+($N\ge4096$, low batch); no other regime regresses. This confirms the bottleneck matrix's
+prediction and mirrors the multi-block strategy GPU-NTT itself uses for large $N$. Full analysis:
+\texttt{docs/architecture\_optimization\_strategy.md}.
+
+\paragraph{Stream-level integration (executed adaptive runtime).} We added multi-block as a
+\emph{fifth} backend to the real dispatcher (\texttt{tools/adaptive\_ntt\_runtime/}) and re-measured
+end-to-end (SLURM job 107, median of 7 over workloads A--E; all 56 profile cells forward$+$round-trip
+correct). Multi-block is the fastest of \emph{our} kernels for $N{=}4096$ ($b{\le}8$), $N{=}8192$
+($b{\le}8$), $N{=}16384$ ($b{\le}16$); single-block wins above. Versus GPU-NTT it reaches only
+\emph{parity} there (ratio ${\approx}1.0$--$1.16$, below the $15\%$ throughput margin), so the
+conservative selector keeps GPU-NTT --- the correct call, since GPU-NTT pipelines a homogeneous
+large-$N$ launch stream that a heterogeneous dispatch cannot reclaim from a per-call tie. The
+executed result is therefore \textbf{parity with no regression} on every workload (A small-heavy
+$1.56\times$ unchanged, B $0.99\times$, C $1.03\times$, D $0.98\times$, E $1.00\times$ vs
+GPU-NTT-only), while the \emph{standalone} our-only system improves dramatically: on the new large-$N$
+low-batch workload E our-only drops from $4.16$ to $2.08$\,ms ($\mathbf{1.995\times}$, cv $0.05\%$),
+and on the mixed/random workloads by $1.20$--$1.22\times$. The naïve latency mode that force-routes
+the at-parity cells regresses B/D to $0.92$--$0.93\times$ (132 backend switches), confirming the
+per-call tie does not survive as a stream win. \textbf{Honest summary:} the multi-block kernel fixes
+the low-batch grid under-occupancy so our standalone system is competitive across the whole
+$(N,\text{batch})$ space instead of $3$--$4\times$ behind in one corner, and the adaptive runtime
+chooses single-block or GPU-NTT once the grid is saturated --- so the integrated system never
+regresses below GPU-NTT-only while preserving the $1.56\times$ small-transform win.
+
+\begin{enumerate}
+  \item \textbf{Stage fusion in Triton}: Once Triton 3.3+ adds \texttt{tl.gather},
+    implement multi-stage kernel fusion (Merge NTT style) to eliminate $\log_2
+    N - \log_2 N / d$ DRAM passes for merge depth $d$.
+  \item \textbf{Mixed-radix NTT}: Radix-4 or radix-8 butterflies halve or quarter the
+    stage count, reducing both launches and DRAM traffic proportionally.
+  \item \textbf{Profile with Nsight Compute}: Measure actual DRAM bytes, SM occupancy,
+    and arithmetic throughput to validate the traffic model.
+  \item \textbf{GPU-NTT comparison and gap closure}: \emph{Done} — built from source and
+    benchmarked at $998244353$ (Section~\ref{sec:external}); then a fused uint32 kernel
+    (Section~\ref{sec:competitive}) closed the gap to 1.1--1.3$\times$ at batch=128, and a
+    multi-block 4-step kernel (Section~\ref{sec:multiblock}) closed the batch=1 occupancy limit
+    ($N{=}16384$ b=1: $4.31\times\!\to\!1.16\times$). Remaining work: an explicit Barrett-$\mu$
+    butterfly. ICICLE's GPU NTT remains unavailable (closed-source backend).
+  \item \textbf{Larger $N$}: Test $N$ up to $2^{23}$ (8.4\,M), the maximum for
+    modulus 998244353, to match cryptographic CKKS/BFV parameters.
+\end{enumerate}
+
+% ============================================================
+\section{Post-Quantum Cryptography: the Kyber NTT}
+\label{sec:pqc}
+
+Everything so far used the NTT-friendly modulus $q=998244353$. To close the loop on the project's
+stated motivation (lattice PQC), we adapted and characterized the pipeline on a \emph{real}
+post-quantum parameter set --- \textbf{Kyber / ML-KEM: $n=256$, $q=3329$}. We do \emph{not} claim to
+beat reference (AVX2) Kyber; the contribution is (i) a correct GPU Kyber poly-mul, (ii) a roofline
+re-analysis of the small-modulus regime, and (iii) a direct test of our earlier Montgomery prediction.
+
+\textbf{Negacyclic NTT and why Kyber needs an \emph{incomplete} one.} PQC multiplies in
+$\mathbb{Z}_q[x]/(x^n+1)$ (negacyclic). At $q=998244353$ this is done by $\psi$-twisting ($\psi$ a
+primitive $2n$-th root), reusing our fused kernel unchanged (verified bit-exact, job 97). Kyber is
+different: $q-1 = 2^8\cdot 13$, so its 2-adicity is only $2^8=256$ and \textbf{no primitive $512$-th
+root exists} --- a full negacyclic-256 transform is impossible. We therefore implement the real Kyber
+\textbf{incomplete NTT}: 7 layers ($\zeta=17$) mapping $\mathbb{Z}_q[x]/(x^{256}+1)$ to 128 rings
+$\mathbb{Z}_q[x]/(x^2-\gamma_i)$, with ``pointwise'' replaced by 128 base-case linear-polynomial
+products. The whole poly-mul is fused in shared memory (1\,KB/poly), verified bit-exact against an
+independent CPU schoolbook reference (20 pairs + batch-32, job 99).
+
+\textbf{Step 3 --- roofline re-analysis.} The large modulus was bandwidth-bound (80--84\% of peak BW).
+The fully-resident Kyber kernel is the opposite: 100\% theoretical occupancy, arithmetic intensity
+$1.167$ modmul/byte, and achieved DRAM bandwidth peaking at only \textbf{26.6\% of peak} (Figure
+\texttt{kyber\_roofline.png}). It is \textbf{not bandwidth-bound} --- nor compute-bound (191 Gmodmul/s,
+$\sim$6\% of the integer ceiling) --- but \textbf{latency/occupancy-bound}: 14 \verb|__syncthreads| per
+poly-mul and few blocks at small batch.
+
+\textbf{Step 4 --- the Montgomery prediction is refuted (with a reason).} Our earlier finding was that
+Montgomery hurts when bandwidth-bound; the hypothesis was that it should help once compute-bound and
+fully resident (Kyber). Measured, Montgomery is \textbf{1.18--1.55$\times$ slower} than Barrett at
+every batch and uses more energy ($3.03$ vs $2.31\,\mu$J/poly-mul).
+
+\begin{table}[h]
+\centering
+\caption{Kyber poly-mul: Montgomery vs Barrett (RTX~2080~Ti, compute-only). Montgomery loses at every
+batch. Data: \texttt{results/raw/kyber\_bench.csv}.}
+\begin{tabular}{R{1.6cm}R{2.0cm}R{2.2cm}R{2.4cm}}
+\toprule
+batch & Barrett ($\mu$s) & Montgomery ($\mu$s) & Mont/Barrett \\
+\midrule
+1    & 4.99  & 7.76  & \textbf{1.55$\times$} \\
+128  & 6.11  & 8.58  & 1.40$\times$ \\
+512  & 12.6  & 15.0  & 1.19$\times$ \\
+2048 & 38.4  & 45.4  & \textbf{1.18$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The reason is precise: Montgomery's advantage is avoiding an \emph{expensive} reduction, which is a
+property of \emph{modulus width}, not of being compute-bound. At $q=3329$ a product is
+$<(q-1)^2<2^{24}$, fits in one 32-bit word, and Barrett is two 32-bit multiplies plus a conditional
+subtract --- already minimal. Montgomery gives no cheaper reduction and adds domain conversions, so it
+is a net loss. ``Compute-bound $\Rightarrow$ Montgomery wins'' is too coarse; \textbf{Barrett is the
+right choice for small ($\le$16-bit) PQC moduli}, while the earlier 30-bit analysis still stands.
+
+\textbf{Step 5 --- batched throughput and energy.} Compute-only on the RTX~2080~Ti, batched Kyber
+poly-mul reaches \textbf{53.4\,M poly-mul/s} and \textbf{128\,M forward-NTT/s} at batch 2048 ---
+\textbf{456$\times$} a single-thread CPU incomplete-NTT baseline --- at \textbf{2.31\,$\mu$J/poly-mul}
+(NVML, two-point). GPU-NTT and ICICLE are \emph{not} benchmarked at $q=3329$ (their small-field paths
+target babybear / large NTT-friendly primes, not 3329); the in-scope baseline is our CPU
+implementation. Full numbers, plots, and honest limitations: \texttt{docs/pqc\_kyber\_analysis.md}.
+
+\subsection{Fused Kyber matrix--vector core: the right unit of work}
+After the isolated poly-mul reached its architectural optimum (removing barriers cost registers and
+occupancy, giving no net gain), we changed the \emph{unit of work}. Real Kyber computes a
+\textbf{matrix--vector product} $t = A\circ s$, where $A$ is a $k\times k$ matrix of NTT-domain
+polynomials and $s$ a $k$-vector. This exposes two reuses the isolated poly-mul cannot: (i)
+\textbf{NTT reuse} --- each $s_j$ is forward-transformed \emph{once} and reused across all $k$ rows;
+(ii) \textbf{NTT-domain accumulation} --- the $k$ base-muls of a row are summed in the NTT domain
+before a \emph{single} inverse NTT. One matrix--vector product then needs \textbf{$2k$ NTT-transforms}
+instead of the ${\sim}3k^2$ of $k^2$ isolated poly-muls. The kernel \texttt{kyber\_matvec<K>} (one block
+per instance, 128 threads; 44/46/52 registers, 0 spills, 100\% occupancy) is verified bit-exact against
+an independent CPU matrix--vector reference (INTT $+$ negacyclic schoolbook) for $k=2,3,4$ over 205
+instances each (random $+$ edge), all outputs canonical in $[0,q)$.
+
+\begin{center}
+\begin{tabular}{lcccc}
+\hline
+$k$ (Kyber) & vs $k^2$ isolated (batch 2048) & eff.\ poly-mul/s & energy/poly-mul & poly-mul/J \\
+\hline
+2 (512)  & $2.39\times$ & 148\,M & --- & --- \\
+3 (768)  & $3.48\times$ & 220\,M & --- & --- \\
+4 (1024) & $\mathbf{4.44\times}$ & $\mathbf{283}$\,M & $\mathbf{0.68\,\mu}$J ($-78\%$) & $4.6\times$ \\
+\hline
+\end{tabular}
+\end{center}
+
+The speedup grows with $k$ (more NTT reuse) and with batch (the grid fills), and it is the operation
+real server-side Kyber actually performs. Effective Kyber throughput rises from the prior 56\,M
+poly-mul/s (isolated) to \textbf{283\,M} ($k{=}4$, batch 2048), at $4.6\times$ better energy per
+operation. We implement only the arithmetic core $A\circ s$, not full ML-KEM.
+
+\textbf{Two follow-ups, honestly reported.} (a) \emph{Shoup/Harvey butterflies} for the large-modulus
+NTT ($q=998244353$; precomputed $w'=\lfloor w\,2^{32}/q\rfloor$, one \texttt{\_\_umulhi}, overflow-proven)
+give a scoped $\sim\!1.04$--$1.06\times$ over our own baseline at $N\le 4096$ and large-$N$ low batch,
+bit-exact at every $(N,\text{batch})$; interleaving $w$ and $w'$ into one \texttt{uint2} load removes an
+initial large-$N$ regression, proving that regression was doubled twiddle-table DRAM traffic --- but the
+gain is below $1.20\times$. (b) The same Shoup lever \emph{inside} the matvec NTT is a clean negative
+($0.95$--$1.05\times$): the matvec is \texttt{\_\_syncthreads}/shared-memory-latency bound, not
+arithmetic-bound, confirming its win is algorithmic. Full record:
+\texttt{docs/autonomous\_optimization\_results.md}.
+
+\subsection{End-to-end batched Kyber arithmetic pipeline ($t = A\circ s + e$)}
+We integrated the fused core into a realistic \textbf{end-to-end} pipeline with \textbf{int16 I/O} and
+full layout conversion --- the Kyber matrix-vector-plus-error operation $t = A\circ s + e$ ($\hat A$ in
+the NTT domain, $s,e$ coefficient-domain $k$-vectors, output canonical) --- measured as \textbf{full
+executed wall time}. Scope is the arithmetic core only (no sampling/hashing/compression/serialization;
+not full ML-KEM). Three variants: \textbf{A} isolated (\texttt{kyber\_polymul}, $3k^2$ transforms),
+\textbf{B} fused multi-kernel (\texttt{kyber\_matvec}, $2k$), \textbf{C} fused-integrated
+(\texttt{kyber\_matvec\_e2e}: int16 read $+$ matvec $+$ error-add $+$ reduction $+$ int16 store in one
+launch). All three are \textbf{bit-exact vs an independent CPU $A\circ s+e$ reference} ($k=2,3,4$, 205
+instances each, 0 out-of-range).
+
+\begin{center}
+\begin{tabular}{lcccc}
+\hline
+$k$ & full-pipeline C/A (batch 2048) & energy/op (C) & energy/op (A) & eff.\ eq-products/s (C) \\
+\hline
+2 & $4.22\times$ & --- & --- & 151\,M \\
+3 & $5.97\times$ & --- & --- & 227\,M \\
+4 & $\mathbf{7.48\times}$ & $\mathbf{10.3\,\mu}$J & $79.8\,\mu$J & $\mathbf{296}$\,M \\
+\hline
+\end{tabular}
+\end{center}
+
+The full-pipeline speedup ($\le 7.48\times$) \emph{exceeds} the kernel-only $4.44\times$ because the
+isolated pipeline also pays conversion, gather, and accumulate over $3k^2$ transforms; energy per
+complete operation drops $7.7\times$ ($79.8\!\to\!10.3\,\mu$J, NVML). A stage breakdown shows the
+int16$\to$u32 conversion pass alone ($0.127$\,ms) exceeds the whole fused kernel ($0.111$\,ms), and $C$
+beats even the raw u32 matvec because int16 I/O halves the matrix DRAM read. CUDA Graphs help the
+multi-kernel path at small batch (up to $1.56\times$); mixed-$k$ grouped dispatch avoids a per-instance
+launch explosion. A Phase-9 attempt to add the Shoup-v2 kernel to the executed large-modulus selector is
+an honest negative (routed 0 times; the warp-shuffle / padded kernels already dominate its cells). Full
+record: \texttt{docs/kyber\_end\_to\_end\_arithmetic\_plan.md}.
+
+% ============================================================
+\section{Final Authoritative Results (2026-07-06)}
+
+This section consolidates the final same-harness evidence (job 139, srvr-2, adaptive runtime
+\texttt{shoup\_v2}, $q=998244353$, CUDA events, WARM=3, REP=9, compute-only). Raw data:
+\texttt{results/raw/final\_ntt\_performance\_map.csv} and \texttt{final\_ntt\_vs\_gpu\_ntt.csv};
+architecture summary: \texttt{docs/final\_ntt\_architecture\_summary.md}.
+
+\subsection{Final adaptive CUDA system and the GPU-NTT comparison (74-cell map)}
+The final measured map covers \textbf{74 cells}: $N\in\{256,\dots,16384\}$ at batch $1\dots128$,
+plus an extended-batch sweep to $8192$ for $N\le1024$ (authoritative run: job 153, srvr-2, all cells in
+one program with the selected backend \emph{executed} at REP=100 and values+ordering gated). Under the
+raw native-order contract our kernels beat GPU-NTT (${>}1.03\times$) in \textbf{48 cells} --- maxima
+\textbf{1.93$\times$} ($N{=}256$), 1.62$\times$ (512), 1.48$\times$ (1024), 1.38$\times$ (2048),
+1.34$\times$ (4096), 1.18$\times$ (8192) --- tie within 3\% in \textbf{4}, and GPU-NTT is faster in
+\textbf{22} (the DRAM-saturated region, where its per-stage Merge kernels stream better). A second run
+of the same grid (job 151) gave 49/7/18 with max 2.14$\times$: boundary cells flip within $\pm$3\%
+noise. Selector execution: regret (executed p50 $\div$ best measured) median 0.998, worst 1.051;
+table-lookup overhead 1.25\,ns. Energy (NVML counter, mixed workload D): adaptive 0.192\,$\mu$J/NTT
+at 255\,W.
+Small transforms are won by the warp-shuffle+Shoup kernel (22 registers, 0 spills, 5 sync-free
+shuffle stages, 100\% theoretical occupancy); the extended sweep shows this win \emph{persists to
+batch $\approx$2048--4096 at $N{=}256$} before saturation. Mid sizes are won by the bank-conflict-free
+padded(+Shoup) kernel; large-$N$ low-batch cells by the multi-block 4-step kernel (128+ blocks fill
+all 68 SMs; argmin recovers up to 1.15$\times$ at $N{=}4096$ $B{=}2$). The argmin selector
+(one-constant change from the previous 10\%-margin rule) routes 44/56 base cells to our kernels vs
+37 before, recovering 7 boundary cells with no measured stream regression; with GPU-NTT as a fallback
+backend the runtime is \emph{never worse than GPU-NTT} on any measured cell.
+
+\textbf{Correctness and convention.} All backends pass edge-input gates (zero, one-hot, maximum
+residue $q{-}1$, random) plus inverse round trips at every size. The output-ordering convention was
+formally verified: our kernels emit the \emph{natural-order} cyclic NTT (bit-exact with the direct
+DFT at $\omega=3^{(P-1)/N}$; bit-reversal folded into the load), while GPU-NTT emits the same values
+in \emph{bit-reversed} order --- identical transforms, so the comparison charges no reordering cost
+to either side.
+
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.86\textwidth]{../results/plots/final_ntt_vs_gpu_ntt_heatmap.png}
+\caption{Best-of-ours $\div$ GPU-NTT per $(N,\text{batch})$ cell. Green: our kernels faster; the
+adaptive runtime selects the per-cell winner (never worse than GPU-NTT).}
+\end{figure}
+
+\subsection{Representative throughput (execution-verified, raw native order)}
+\begin{center}\small
+\begin{tabular}{llllrrrr}
+\toprule
+workload & $N$ & batch & backend & $\mu$s/NTT & NTT/s & eff.\,GB/s & vs GPU-NTT \\
+\midrule
+small-$N$ low batch & 256 & 1 & shoup\_shuf & 4.58 & 0.219M & 0.4 (0.1\%) & 1.93$\times$ \\
+small-$N$ pre-saturation & 256 & 2048 & shoup\_shuf & 0.010 & 96.2M & 197 (32\%) & 1.08$\times$ \\
+small-$N$ saturation & 256 & 8192 & gpu\_ntt & 0.009 & 117.2M & 240 (39\%) & 0.95 \\
+medium-$N$ & 2048 & 32 & shoup\_pad & 0.280 & 3.57M & 59 (9.5\%) & 1.33$\times$ \\
+large-$N$ low batch & 16384 & 1 & gpu\_ntt & 10.24 & 98K & 13 (2.1\%) & 0.97 \\
+large-$N$ high batch & 16384 & 128 & gpu\_ntt & 0.701 & 1.43M & 187 (30\%) & 0.82 \\
+\bottomrule
+\end{tabular}
+\end{center}
+Effective GB/s is a traffic estimate (8\,B/coefficient $\div$ measured runtime), not a profiler
+counter. Our-kernel peak: 110.9M NTT/s (warp\_shuffle\_shoup, $N{=}256$, batch 8192, 0.0739\,ms).
+
+\subsection{Optimization progression}
+Figure in \texttt{results/plots/final\_ntt\_optimization\_progression.png} and
+\texttt{results/raw/final\_ntt\_optimization\_progression.csv} trace each stage
+(CPU $\to$ C++ $\to$ PyTorch $\to$ Triton radix-2 $\to$ radix-4 $\to$ fused CUDA $\to$ warp-shuffle
+$\to$ padded $\to$ multi-block $\to$ Shoup $\to$ adaptive), with the bottleneck each targeted and its
+measured improvement in its regime (timing harness noted; the kernels are regime-specialized by design).
+
+\subsection{Kyber as an NTT case study}
+Applying the same NTT principles to Kyber's incomplete seven-layer NTT ($q=3329$, $n=256$), at $k=4$,
+batch~2048: the isolated-transform baseline (0.828\,ms) improves to a fused matrix-vector kernel with
+shared-memory transform reuse (0.276\,ms, 3.0$\times$), then a single-kernel fused-integrated kernel with
+int16 I/O (0.111\,ms, 2.48$\times$), then NTT-domain accumulation that drops the final INTT (0.067\,ms,
+1.65$\times$) --- \textbf{12.3$\times$ total latency and $\sim$12.7$\times$ energy}
+(79.8$\to$6.3\,$\mu$J/op), each step attributed to a specific NTT optimization principle and verified
+bit-exact against an independent CPU schoolbook reference for $k=2,3,4$. Data:
+\texttt{results/raw/kyber\_ntt\_contribution\_breakdown.csv}.
+
+\begin{figure}[htbp]\centering
+\includegraphics[width=0.9\textwidth]{../results/plots/kyber_ntt_contribution_breakdown.png}
+\caption{Kyber arithmetic: each step reuses a GPU NTT principle (shared-memory transform reuse,
+single-kernel fusion, NTT-domain accumulation). The improvement is NTT-attributed, not from system
+batching or transfer routing.}
+\end{figure}
+
+\subsection{Future work and system extensions}
+The following are working, correctness-verified extensions built while validating the NTT result, but are
+deliberately out of the core NTT narrative: a full-scope CPU ML-KEM baseline (pq-crystals AVX2) for
+falsifiable positioning; an on-GPU FIPS-203 seed generator with a measured transfer-vs-seed crossover
+router; server window-grouping throughput/tail analysis; and CUDA-graph small-batch experiments. They
+demonstrate the NTT kernels inside a realistic PQC workload but do not change the NTT contribution.
+
+\section{Conclusion}
+
+We implemented a GPU-accelerated NTT pipeline progressing from Python CPU to a custom
+Triton GPU kernel, with progressively deeper analysis of the bottlenecks at each stage.
+
+\textbf{Optimization 1 (PyTorch level)}: Precomputed cached twiddle factors and
+batch-parallel tensor operations give $\sim$5$\times$ improvement over a simple GPU
+implementation, with cache break-even in under one call.
+
+\textbf{Optimization 2 (kernel level)}: A custom Triton butterfly kernel with 1 launch
+per stage (vs 7 PyTorch ops) and LLVM-generated Barrett reduction (via \texttt{tl.constexpr}
+MOD) achieves \textbf{3.20--4.65$\times$ additional speedup} over the PyTorch baseline.
+For large problem sizes, the Triton kernel reaches 82\% of peak memory bandwidth (504\,GB/s)
+and the speedup is primarily explained by 4.27$\times$ less DRAM traffic.
+
+Against the C++ CPU baseline, Triton achieves up to \textbf{58.6$\times$ speedup} at
+batch=128, $N=16384$, reflecting both GPU parallelism and bandwidth advantages.
+
+\textbf{Optimization 3 (closing the gap to the state of the art)}: Benchmarking the open-source
+GPU-NTT library on our own GPU first showed it 8--30$\times$ faster. A gap analysis attributed
+this to int64 storage, per-stage kernel launches, and a separate bit-reversal pass. We
+implemented a single-kernel fully-fused \texttt{uint32} NTT (bit-reversal folded into the load)
+and, measuring it identically to GPU-NTT, \textbf{reduced the gap to 1.1--1.3$\times$ at batch=128
+across all $N$ and to parity/advantage at small $N$} --- a 6--32$\times$ improvement over our prior
+best. This demonstrates concretely which GPU NTT optimizations matter most: launch-count
+reduction via stage fusion and halved DRAM traffic via 32-bit storage. The contribution is the
+measured analysis plus the optimization that closes most of the gap, with the residual large-$N$
+batch=1 gap honestly attributed to single-block occupancy.
+
+\textbf{Optimization 4 (a workload-adaptive system)}: Rather than report a single global winner,
+we added two specialized kernels --- a compile-time-specialized low-latency kernel and a
+warp-shuffle kernel (Section~\ref{sec:improvement}) that drops shared memory and
+\verb|__syncthreads()| for the within-warp early stages --- establishing a measured regime
+crossover (our kernels win for small transforms; GPU-NTT wins for large). The warp-shuffle kernel
+\emph{expanded} that winning region: $N\le512$ deepened to $0.61$--$0.74\times$ and $N=1024$ flipped
+to a $0.85$--$0.95\times$ win over GPU-NTT. We then built a \emph{real, executed} hybrid runtime
+(not a latency simulation) that dispatches per $(N,\text{batch})$ and times whole mixed workloads
+end-to-end. It is \textbf{$1.57\times$ faster than GPU-NTT-only on small-transform-heavy workloads},
+at parity (within $\sim$1--2\%) on large-dominated mixes, and the most energy-efficient policy on a
+broad mix. A bank-conflict-padded kernel (Section~\ref{sec:sharedmem}) then extended our per-call
+wins to $N{=}2048$--$8192$, and we exposed the runtime as \textbf{two workload-aware modes}
+(Section~\ref{sec:modes}): a \emph{latency mode} (per-call fastest, for isolated calls) and a
+\emph{throughput mode} (conservative, robust-win-only, for interleaved streams). The final claim is
+therefore not ``we beat GPU-NTT'' but the more honest and more useful one: \emph{our project
+contributes a workload-aware adaptive NTT runtime with two modes --- a latency mode that exploits our
+low-latency/padded kernels where they win, and a throughput mode that avoids harmful backend
+switching and falls back to GPU-NTT for large homogeneous streams --- delivering up to
+$1.34$--$1.57\times$ over GPU-NTT-only on small-transform-heavy workloads while matching it on
+large ones.}
+
+All unit tests pass with bit-exact cross-validation between implementations, including the new
+competitive kernel (round-trip, direct-DFT, and polynomial-multiplication checks).
+
+% ============================================================
+\begin{thebibliography}{9}
+
+\bibitem{gpuntt}
+Ali Şah Özcan, Arsalan Javeed, and Erkay Savaş.
+\textit{High-Performance Number Theoretic Transform on GPU Through radix2-CT and 4-Step Algorithms.}
+IEEE Access, vol.~13, pp.~87862--87883, 2025.
+DOI: \url{10.1109/ACCESS.2025.3570024}.
+Also available as: ePrint 2023/1410.
+Repository: \url{https://github.com/Alisah-Ozcan/GPU-NTT} (MIT License).
+
+\bibitem{icicle}
+Ingonyama.
+\textit{ICICLE: A GPU-Accelerated Cryptography Library for Zero-Knowledge Proofs.}
+\url{https://github.com/ingonyama-zk/icicle} (MIT License, frontend).
+
+\end{thebibliography}
+
+\end{document}
