@@ -1,0 +1,49 @@
+node: srvr-2.taueng.local
+NVIDIA GeForce RTX 2080 Ti, 550.120, 7.5
+device: NVIDIA GeForce RTX 2080 Ti, sm_75, smemOptin=64 KB
+independent direct-DFT check at N=16: PASS
+Our competitive fused NTT (modulus 998244353, uint32, single-kernel fused)
+logn   batch  compute_ms   h2d_incl_ms    fwd_ok   rt_ok   
+10     1      0.00864      0.01992        yes      yes     
+10     8      0.00883      0.03067        yes      yes     
+10     32     0.00928      0.07179        yes      yes     
+10     128    0.01318      0.24365        yes      yes     
+11     1      0.01222      0.02938        yes      yes     
+11     8      0.01242      0.04859        yes      yes     
+11     32     0.01267      0.13810        yes      yes     
+11     128    0.02582      0.47403        yes      yes     
+12     1      0.01869      0.03958        yes      yes     
+12     8      0.01936      0.08768        yes      yes     
+12     32     0.01957      0.25142        yes      yes     
+12     128    0.04302      0.81752        yes      yes     
+13     1      0.02875      0.05390        yes      yes     
+13     8      0.02898      0.15405        yes      yes     
+13     32     0.02970      0.47130        yes      yes     
+13     128    0.07485      1.50142        yes      yes     
+14     1      0.05325      0.08928        yes      yes     
+14     8      0.05358      0.28437        yes      yes     
+14     32     0.05483      0.82021        yes      yes     
+14     128    0.15115      2.87590        yes      yes     
+exit=0
+--- CSV ---
+impl,modulus,N,logn,batch,direction,compute_ms,h2d_inclusive_ms,correct,roundtrip
+ours_competitive,998244353,1024,10,1,forward,0.008640,0.019920,1,1
+ours_competitive,998244353,1024,10,8,forward,0.008832,0.030672,1,1
+ours_competitive,998244353,1024,10,32,forward,0.009280,0.071792,1,1
+ours_competitive,998244353,1024,10,128,forward,0.013184,0.243648,1,1
+ours_competitive,998244353,2048,11,1,forward,0.012224,0.029376,1,1
+ours_competitive,998244353,2048,11,8,forward,0.012416,0.048592,1,1
+ours_competitive,998244353,2048,11,32,forward,0.012672,0.138096,1,1
+ours_competitive,998244353,2048,11,128,forward,0.025824,0.474032,1,1
+ours_competitive,998244353,4096,12,1,forward,0.018688,0.039584,1,1
+ours_competitive,998244353,4096,12,8,forward,0.019360,0.087680,1,1
+ours_competitive,998244353,4096,12,32,forward,0.019568,0.251424,1,1
+ours_competitive,998244353,4096,12,128,forward,0.043024,0.817520,1,1
+ours_competitive,998244353,8192,13,1,forward,0.028752,0.053904,1,1
+ours_competitive,998244353,8192,13,8,forward,0.028976,0.154048,1,1
+ours_competitive,998244353,8192,13,32,forward,0.029696,0.471296,1,1
+ours_competitive,998244353,8192,13,128,forward,0.074848,1.501424,1,1
+ours_competitive,998244353,16384,14,1,forward,0.053248,0.089280,1,1
+ours_competitive,998244353,16384,14,8,forward,0.053584,0.284368,1,1
+ours_competitive,998244353,16384,14,32,forward,0.054832,0.820208,1,1
+ours_competitive,998244353,16384,14,128,forward,0.151152,2.875904,1,1

@@ -1,0 +1,18 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /home/eprojuser016/kareem_finalproject/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/eprojuser016/kareem_finalproject
+collecting ... collected 3 items
+
+tests/test_competitive_ntt.py::TestCompetitiveNTT::test_forward_matches_direct_dft PASSED [ 33%]
+tests/test_competitive_ntt.py::TestCompetitiveNTT::test_polymul_matches_schoolbook PASSED [ 66%]
+tests/test_competitive_ntt.py::TestCompetitiveNTT::test_roundtrip PASSED [100%]
+
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:61
+  /home/eprojuser016/kareem_finalproject/.venv/lib/python3.12/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+    import pynvml  # type: ignore[import]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+========================= 3 passed, 1 warning in 2.41s =========================
+pytest_exit=0

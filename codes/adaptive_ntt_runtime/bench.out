@@ -1,0 +1,142 @@
+node: srvr-2.taueng.local
+NVIDIA GeForce RTX 2080 Ti, 550.120, 7.5
+=== compile adaptive_runtime ===
+tools/adaptive_ntt_runtime/../low_latency_cuda_ntt/low_latency_ntt_kernels.cu(29): warning #1556-D: name linkage conflicts with previous declaration of variable "s" (declared at line 39 of tools/adaptive_ntt_runtime/../competitive_cuda_ntt/competitive_ntt_kernels.cu)
+      extern __attribute__((shared)) u32 s[];
+                                         ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+tools/adaptive_ntt_runtime/../low_latency_cuda_ntt/low_latency_ntt_kernels.cu(29): warning #1556-D: name linkage conflicts with previous declaration of variable "s" (declared at line 39 of tools/adaptive_ntt_runtime/../competitive_cuda_ntt/competitive_ntt_kernels.cu)
+      extern __attribute__((shared)) u32 s[];
+                                         ^
+
+Remark: The warnings can be suppressed with "-diag-suppress <warning-number>"
+
+compile exit=0
+=== bench (grid+small-N) + real adaptive runtime (REP=7) ===
+device: NVIDIA GeForce RTX 2080 Ti sm_75 optin=64KB
+N      batch gpu_ms     fused     lowlat    shuffle   ratio   winner 
+256    1     0.00866    0.00614   0.00669   0.00538   0.621   ours   
+256    2     0.00870    0.00637   0.00691   0.00550   0.632   ours   
+256    4     0.00819    0.00640   0.00680   0.00544   0.664   ours   
+256    8     0.00885    0.00638   0.00699   0.00542   0.613   ours   
+256    16    0.00870    0.00648   0.00688   0.00547   0.629   ours   
+256    32    0.00827    0.00650   0.00694   0.00566   0.685   ours   
+256    64    0.00851    0.00685   0.00731   0.00584   0.686   ours   
+256    128   0.00861    0.00706   0.00731   0.00614   0.714   ours   
+512    1     0.00858    0.00718   0.00757   0.00594   0.692   ours   
+512    2     0.00854    0.00706   0.00755   0.00602   0.704   ours   
+512    4     0.00853    0.00715   0.00770   0.00605   0.709   ours   
+512    8     0.00819    0.00728   0.00773   0.00608   0.742   ours   
+512    16    0.00838    0.00706   0.00782   0.00608   0.725   ours   
+512    32    0.00837    0.00709   0.00781   0.00614   0.734   ours   
+512    64    0.00866    0.00784   0.00794   0.00666   0.769   ours   
+512    128   0.00936    0.00824   0.00835   0.00712   0.761   ours   
+1024   1     0.00853    0.00866   0.00893   0.00781   0.916   ours   
+1024   2     0.00934    0.00882   0.00938   0.00795   0.851   ours   
+1024   4     0.00880    0.00883   0.00939   0.00803   0.913   ours   
+1024   8     0.00846    0.00894   0.00947   0.00806   0.953   ours   
+1024   16    0.00872    0.00926   0.00906   0.00808   0.927   ours   
+1024   32    0.00864    0.00914   0.00941   0.00824   0.954   ours   
+1024   64    0.00982    0.01024   0.01024   0.00947   0.964   ours   
+1024   128   0.01186    0.01320   0.01224   0.01456   1.032   gpu_ntt
+2048   1     0.01138    0.01222   0.01178   nan       1.035   gpu_ntt
+2048   2     0.01115    0.01229   0.01187   nan       1.065   gpu_ntt
+2048   4     0.01114    0.01229   0.01200   nan       1.078   gpu_ntt
+2048   8     0.01157    0.01234   0.01205   nan       1.041   gpu_ntt
+2048   16    0.01181    0.01242   0.01197   nan       1.014   gpu_ntt
+2048   32    0.01248    0.01267   0.01216   nan       0.974   ours   
+2048   64    0.01472    0.01499   0.01406   nan       0.955   ours   
+2048   128   0.02075    0.02602   0.02341   nan       1.128   gpu_ntt
+4096   1     0.01182    0.01862   0.01723   nan       1.457   gpu_ntt
+4096   2     0.01187    0.01882   0.01760   nan       1.482   gpu_ntt
+4096   4     0.01182    0.01928   0.01779   nan       1.505   gpu_ntt
+4096   8     0.01187    0.01955   0.01771   nan       1.492   gpu_ntt
+4096   16    0.01229    0.01917   0.01779   nan       1.448   gpu_ntt
+4096   32    0.01536    0.01949   0.01800   nan       1.172   gpu_ntt
+4096   64    0.02211    0.02410   0.02245   nan       1.015   gpu_ntt
+4096   128   0.03350    0.04301   0.03978   nan       1.187   gpu_ntt
+8192   1     0.01162    0.02867   0.02789   nan       2.401   gpu_ntt
+8192   2     0.01158    0.02867   0.02795   nan       2.413   gpu_ntt
+8192   4     0.01200    0.02896   0.02763   nan       2.303   gpu_ntt
+8192   8     0.01318    0.02899   0.02802   nan       2.125   gpu_ntt
+8192   16    0.01539    0.02914   0.02794   nan       1.815   gpu_ntt
+8192   32    0.02227    0.02965   0.02853   nan       1.281   gpu_ntt
+8192   64    0.03427    0.03973   0.03858   nan       1.126   gpu_ntt
+8192   128   0.05733    0.07498   0.07168   nan       1.250   gpu_ntt
+16384  1     0.01182    0.05328   0.05120   nan       4.330   gpu_ntt
+16384  2     0.01198    0.05344   0.05120   nan       4.272   gpu_ntt
+16384  4     0.01312    0.05358   0.05154   nan       3.928   gpu_ntt
+16384  8     0.01637    0.05358   0.05150   nan       3.147   gpu_ntt
+16384  16    0.02285    0.05379   0.05141   nan       2.250   gpu_ntt
+16384  32    0.03610    0.05470   0.05250   nan       1.454   gpu_ntt
+16384  64    0.06126    0.07552   0.07306   nan       1.192   gpu_ntt
+16384  128   0.11621    0.15134   0.14746   nan       1.269   gpu_ntt
+
+profile correctness: ALL PASS
+
+=== Real adaptive runtime (executed, REP=7, selector margin=10%) ===
+A_low_latency_small    gpu=1.4338  our=1.0183  adaptive=0.9133 ms (median) | vs_gpu=1.570x vs_our=1.115x | route ours=146 gpu=54
+B_mixed_realistic      gpu=2.5863  our=4.8264  adaptive=2.6214 ms (median) | vs_gpu=0.987x vs_our=1.841x | route ours=39 gpu=161
+C_throughput_large     gpu=12.4951  our=16.3533  adaptive=12.4989 ms (median) | vs_gpu=1.000x vs_our=1.308x | route ours=0 gpu=200
+D_random_grid          gpu=2.6686  our=4.8065  adaptive=2.7278 ms (median) | vs_gpu=0.978x vs_our=1.762x | route ours=71 gpu=129
+all exit=0
+=== energy comparison (NVML two-point subtraction) ===
+/home/eprojuser016/kareem_finalproject/tools/adaptive_ntt_runtime/measure_energy.py:25: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml
+GPU: NVIDIA GeForce RTX 2080 Ti | energy method: nvmlDeviceGetTotalEnergyConsumption | workload D, R=400/800
+gpu_only  runtime=  2.2943 ms  energy=  260.50 mJ  power=113.54 W  E/NTT=  0.1028 uJ  thr/W=9726005.05 NTT/J
+our_only  runtime=  4.4118 ms  energy=  364.20 mJ  power= 82.55 W  E/NTT=  0.1437 uJ  thr/W=6956617.24 NTT/J
+adaptive  runtime=  2.3400 ms  energy=  247.68 mJ  power=105.84 W  E/NTT=  0.0978 uJ  thr/W=10229534.67 NTT/J
+Wrote /home/eprojuser016/kareem_finalproject/results/raw/adaptive_energy_comparison.csv
+energy exit=0
+=== CSVs ===
+--- small_n_optimization_benchmark.csv ---
+N,batch,gpu_ntt_ms,fused_ms,lowlat_ms,shuffle_ms,prior_best_ms,our_best_ms,best_kernel,shuffle_vs_prior,ratio_best_over_gpu,winner,correct
+256,1,0.008656,0.006144,0.006688,0.005376,0.006144,0.005376,shuffle,1.1429,0.6211,ours,1
+256,2,0.008704,0.006368,0.006912,0.005504,0.006368,0.005504,shuffle,1.1570,0.6324,ours,1
+256,4,0.008192,0.006400,0.006800,0.005440,0.006400,0.005440,shuffle,1.1765,0.6641,ours,1
+256,8,0.008848,0.006384,0.006992,0.005424,0.006384,0.005424,shuffle,1.1770,0.6130,ours,1
+256,16,0.008704,0.006480,0.006880,0.005472,0.006480,0.005472,shuffle,1.1842,0.6287,ours,1
+512,1,0.008576,0.007184,0.007568,0.005936,0.007184,0.005936,shuffle,1.2102,0.6922,ours,1
+512,2,0.008544,0.007056,0.007552,0.006016,0.007056,0.006016,shuffle,1.1729,0.7041,ours,1
+512,4,0.008528,0.007152,0.007696,0.006048,0.007152,0.006048,shuffle,1.1825,0.7092,ours,1
+512,8,0.008192,0.007280,0.007728,0.006080,0.007280,0.006080,shuffle,1.1974,0.7422,ours,1
+512,16,0.008384,0.007056,0.007824,0.006080,0.007056,0.006080,shuffle,1.1605,0.7252,ours,1
+1024,1,0.008528,0.008656,0.008928,0.007808,0.008656,0.007808,shuffle,1.1086,0.9156,ours,1
+1024,2,0.009344,0.008816,0.009376,0.007952,0.008816,0.007952,shuffle,1.1087,0.8510,ours,1
+1024,4,0.008800,0.008832,0.009392,0.008032,0.008832,0.008032,shuffle,1.0996,0.9127,ours,1
+1024,8,0.008464,0.008944,0.009472,0.008064,0.008944,0.008064,shuffle,1.1091,0.9527,ours,1
+1024,16,0.008720,0.009264,0.009056,0.008080,0.009056,0.008080,shuffle,1.1208,0.9266,ours,1
+2048,1,0.011376,0.012224,0.011776,nan,0.011776,0.011776,lowlat,nan,1.0352,gpu_ntt,1
+2048,2,0.011152,0.012288,0.011872,nan,0.011872,0.011872,lowlat,nan,1.0646,gpu_ntt,1
+2048,4,0.011136,0.012288,0.012000,nan,0.012000,0.012000,lowlat,nan,1.0776,gpu_ntt,1
+2048,8,0.011568,0.012336,0.012048,nan,0.012048,0.012048,lowlat,nan,1.0415,gpu_ntt,1
+2048,16,0.011808,0.012416,0.011968,nan,0.011968,0.011968,lowlat,nan,1.0136,gpu_ntt,1
+--- adaptive_runtime_benchmark.csv ---
+workload,num_tasks,reps,gpu_only_ms_median,our_only_ms_median,adaptive_ms_median,adaptive_speedup_vs_gpu_ntt,adaptive_speedup_vs_our,calls_chose_ours,calls_chose_gpu_ntt
+A_low_latency_small,200,7,1.4338,1.0183,0.9133,1.5699,1.1149,146,54
+B_mixed_realistic,200,7,2.5863,4.8264,2.6214,0.9866,1.8411,39,161
+C_throughput_large,200,7,12.4951,16.3533,12.4989,0.9997,1.3084,0,200
+D_random_grid,200,7,2.6686,4.8065,2.7278,0.9783,1.7620,71,129
+--- adaptive_reproducibility.csv ---
+workload,policy,reps,mean_ms,median_ms,std_ms,min_ms,max_ms,cv_pct
+A_low_latency_small,gpu_only,7,1.5711,1.4338,0.3192,1.1737,2.1217,20.314
+A_low_latency_small,our_only,7,1.0186,1.0183,0.0013,1.0167,1.0201,0.124
+A_low_latency_small,adaptive,7,0.9156,0.9133,0.0072,0.9076,0.9283,0.787
+B_mixed_realistic,gpu_only,7,2.5864,2.5863,0.0008,2.5853,2.5879,0.032
+B_mixed_realistic,our_only,7,4.8265,4.8264,0.0017,4.8245,4.8301,0.035
+B_mixed_realistic,adaptive,7,2.6213,2.6214,0.0010,2.6195,2.6230,0.040
+C_throughput_large,gpu_only,7,12.4990,12.4951,0.0073,12.4927,12.5157,0.058
+C_throughput_large,our_only,7,16.3509,16.3533,0.0058,16.3415,16.3585,0.036
+C_throughput_large,adaptive,7,12.5005,12.4989,0.0052,12.4956,12.5125,0.042
+D_random_grid,gpu_only,7,2.6692,2.6686,0.0013,2.6682,2.6721,0.049
+D_random_grid,our_only,7,4.8072,4.8065,0.0041,4.8026,4.8137,0.086
+D_random_grid,adaptive,7,2.7283,2.7278,0.0032,2.7252,2.7356,0.116
+--- adaptive_energy_comparison.csv ---
+policy,workload,ntts_per_pass,runtime_ms_per_pass,energy_mj_per_pass,avg_power_w,energy_per_ntt_uj,throughput_ntts_per_s,throughput_per_watt_ntts_per_j
+gpu_only,D,2533600,2.2943,260.498,113.54,0.1028,1104306779.0,9726005.05
+our_only,D,2533600,4.4118,364.200,82.55,0.1437,574278397.9,6956617.24
+adaptive,D,2533600,2.3400,247.675,105.84,0.0978,1082725788.7,10229534.67
+DONE
